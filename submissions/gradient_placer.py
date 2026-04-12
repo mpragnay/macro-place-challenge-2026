@@ -222,26 +222,34 @@ class GradientPlacer:
 
         sizes = benchmark.macro_sizes.float()  # fixed, no grad
 
-        # Canvas bounds for clamping after each step.
-        half_w = sizes[:, 0] / 2.0
-        half_h = sizes[:, 1] / 2.0
-        x_lo = half_w
-        x_hi = torch.full_like(half_w, benchmark.canvas_width) - half_w
-        y_lo = half_h
-        y_hi = torch.full_like(half_h, benchmark.canvas_height) - half_h
+        # Canvas bounds for clamping — computed only for hard macros, then filtered to movable.
+        hard_half_w = sizes[:benchmark.num_hard_macros, 0] / 2.0
+        hard_half_h = sizes[:benchmark.num_hard_macros, 1] / 2.0
+        x_lo = hard_half_w
+        x_hi = torch.full_like(hard_half_w, benchmark.canvas_width) - hard_half_w
+        y_lo = hard_half_h
+        y_hi = torch.full_like(hard_half_h, benchmark.canvas_height) - hard_half_h
+
+        num_hard = benchmark.num_hard_macros
+
+        # Work only with hard macro rows — soft macros never enter the overlap loss.
+        hard_movable = movable[:num_hard]                          # [H] bool
+        movable_idx = hard_movable.nonzero(as_tuple=True)[0]      # [M] int indices
+        hard_base = placement[:num_hard].detach()                  # [H, 2] fixed reference
+        hard_sizes = sizes[:num_hard]                              # [H, 2]
 
         # Optimise only the movable positions as a free parameter.
-        free_pos = placement[movable].clone().requires_grad_(True)
+        free_pos = hard_base[hard_movable].clone().requires_grad_(True)  # [M, 2]
         optimizer = torch.optim.Adam([free_pos], lr=self.lr)
 
         for step in range(self.num_steps):
             optimizer.zero_grad()
 
-            # Assemble full position tensor (detached fixed rows + grad-tracked free rows).
-            full_pos = placement.clone()
-            full_pos[movable] = free_pos
+            # index_put (non-inplace) builds a new [H, 2] tensor in the autograd graph
+            # without cloning the full [N, 2] placement each step.
+            full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)
 
-            loss = _overlap_loss(full_pos, sizes, benchmark.num_hard_macros)
+            loss = _overlap_loss(full_hard_pos, hard_sizes, num_hard)
 
             loss.backward()
             optimizer.step()
@@ -250,12 +258,12 @@ class GradientPlacer:
             # so macros near the boundary don't drift into each other.
             with torch.no_grad():
                 free_pos[:, 0] = torch.max(
-                    torch.min(free_pos[:, 0], x_hi[movable]),
-                    x_lo[movable],
+                    torch.min(free_pos[:, 0], x_hi[hard_movable]),
+                    x_lo[hard_movable],
                 )
                 free_pos[:, 1] = torch.max(
-                    torch.min(free_pos[:, 1], y_hi[movable]),
-                    y_lo[movable],
+                    torch.min(free_pos[:, 1], y_hi[hard_movable]),
+                    y_lo[hard_movable],
                 )
 
             if step % 1000 == 0 or step == self.num_steps - 1:
@@ -263,7 +271,7 @@ class GradientPlacer:
 
         # Write optimised positions back (no extra clamp — already enforced above).
         with torch.no_grad():
-            placement[movable] = free_pos
+            placement[:num_hard][hard_movable] = free_pos
 
         # Restore fixed macros to their original positions.
         fixed_mask = benchmark.macro_fixed
