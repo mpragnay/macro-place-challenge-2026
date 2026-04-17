@@ -378,7 +378,14 @@ class InitialPositions:
                 benchmark.canvas_width, benchmark.canvas_height,
                 benchmark.grid_rows, benchmark.grid_cols,
             )
-        print(f"  density_cost  start={d0.item():.6f}")
+        # Best possible density: uniform spread across all cells.
+        total_macro_area = (sizes[:, 0] * sizes[:, 1]).sum().item()
+        canvas_area = benchmark.canvas_width * benchmark.canvas_height
+        uniform_density = total_macro_area / canvas_area
+        total_cells = benchmark.grid_rows * benchmark.grid_cols
+        k = max(1, math.floor(total_cells * 0.1))
+        best_density_cost = 0.5 * uniform_density
+        print(f"  density_cost  start={d0.item():.6f}  best_possible={best_density_cost:.6f}  (uniform_density={uniform_density:.6f})")
         _print_density_grid(
             placement, sizes,
             benchmark.canvas_width, benchmark.canvas_height,
