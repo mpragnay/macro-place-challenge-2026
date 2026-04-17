@@ -17,6 +17,8 @@ Usage:
     uv run evaluate submissions/gradient_placer.py --all
 """
 
+import math
+
 import torch
 from macro_place.benchmark import Benchmark
 
@@ -80,104 +82,76 @@ def _density_cost(
     grid_cols: int,
 ) -> torch.Tensor:
     """
-    Differentiable density cost.
+    Exact differentiable density cost matching plc_client_os.get_density_cost().
 
-    Uses log-sum-exp over all grid cells as a smooth surrogate for the top-k
-    density cost. LSE has nonzero gradient everywhere (unlike mean, which is
-    constant w.r.t. position for fully in-canvas macros) and naturally
-    emphasises the hottest cells (like top-k) without hard selection.
+    Pass ALL macros (hard + soft, fixed + movable) in benchmark order.
+    Fixed/soft positions should be passed as detached tensors so they
+    contribute to the cost without receiving gradients.
 
-    Per-cell density = sum of clamped overlap areas between each macro
-    and the cell, divided by cell area.
+    Formula (exact match to evaluator):
+        per_cell_density[r,c] = sum_macros(overlap_area(macro, cell[r,c])) / cell_area
+        k = floor(total_cells * 0.1)
+        cost = 0.5 * mean(top-k per_cell_density values)
+             = 0.5 * sum(top-k) / k
 
-    All intermediate ops use torch.min / torch.max so autograd can
-    differentiate through them w.r.t. positions.
+    Note: torch.topk over the full flat grid (including zero cells) replicates
+    the evaluator's behaviour of dividing by k even when fewer than k cells
+    are occupied.
 
     Args:
-        positions:      [N, 2] macro center (x, y) — must have requires_grad
-        sizes:          [N, 2] macro (width, height) — fixed, no grad needed
+        positions:      [N, 2] macro centers — hard first, then soft
+        sizes:          [N, 2] macro (width, height)
         canvas_width:   canvas width in microns
         canvas_height:  canvas height in microns
-        grid_rows:      number of grid rows
-        grid_cols:      number of grid columns
-        top_k_fraction: fraction of cells used for averaging (default 0.1 = top 10%)
+        grid_rows:      grid rows (benchmark.grid_rows)
+        grid_cols:      grid columns (benchmark.grid_cols)
 
     Returns:
-        Scalar density cost tensor (differentiable w.r.t. positions).
+        Scalar density cost (differentiable w.r.t. positions that have requires_grad).
     """
-    N = positions.shape[0]
-    cell_w = canvas_width / grid_cols   # width of one grid cell
-    cell_h = canvas_height / grid_rows  # height of one grid cell
+    cell_w = canvas_width / grid_cols
+    cell_h = canvas_height / grid_rows
     cell_area = cell_w * cell_h
+    total_cells = grid_rows * grid_cols
 
-    # --- macro bounding boxes ---
-    # [N, 1]: left / right / bottom / top edges of each macro
-    half_w = sizes[:, 0:1] / 2.0   # [N, 1]
-    half_h = sizes[:, 1:2] / 2.0   # [N, 1]
-    macro_x0 = positions[:, 0:1] - half_w  # [N, 1]
-    macro_x1 = positions[:, 0:1] + half_w  # [N, 1]
-    macro_y0 = positions[:, 1:2] - half_h  # [N, 1]
-    macro_y1 = positions[:, 1:2] + half_h  # [N, 1]
+    # Macro bounding boxes: [N, 1]
+    half_w = sizes[:, 0:1] / 2.0
+    half_h = sizes[:, 1:2] / 2.0
+    x0 = positions[:, 0:1] - half_w   # [N, 1]
+    x1 = positions[:, 0:1] + half_w
+    y0 = positions[:, 1:2] - half_h
+    y1 = positions[:, 1:2] + half_h
 
-    # --- grid cell bounding boxes ---
-    # col_idx: [1, grid_cols], row_idx: [grid_rows, 1]
-    col_idx = torch.arange(grid_cols, dtype=positions.dtype, device=positions.device).unsqueeze(0)  # [1, C]
-    row_idx = torch.arange(grid_rows, dtype=positions.dtype, device=positions.device).unsqueeze(1)  # [R, 1]
+    # Grid cell boundaries
+    col_idx = torch.arange(grid_cols, dtype=positions.dtype, device=positions.device)  # [C]
+    row_idx = torch.arange(grid_rows, dtype=positions.dtype, device=positions.device)  # [R]
+    cell_x0 = col_idx * cell_w          # [C]
+    cell_x1 = cell_x0 + cell_w
+    cell_y0 = row_idx * cell_h          # [R]
+    cell_y1 = cell_y0 + cell_h
 
-    cell_x0 = col_idx * cell_w                # [1, C]
-    cell_x1 = cell_x0 + cell_w                # [1, C]
-    cell_y0 = row_idx * cell_h                # [R, 1]
-    cell_y1 = cell_y0 + cell_h                # [R, 1]
-
-    # --- overlap area: macro i with each grid cell (r, c) ---
-    # Broadcast to [N, R, C] by inserting dims appropriately.
-    # macro tensors: [N, 1, 1], cell tensors: [1, R, C]
-    macro_x0_3d = macro_x0.unsqueeze(2)       # [N, 1, 1]
-    macro_x1_3d = macro_x1.unsqueeze(2)       # [N, 1, 1]
-    macro_y0_3d = macro_y0.unsqueeze(2)       # [N, 1, 1]
-    macro_y1_3d = macro_y1.unsqueeze(2)       # [N, 1, 1]
-
-    cell_x0_3d = cell_x0.unsqueeze(0)         # [1, 1, C]
-    cell_x1_3d = cell_x1.unsqueeze(0)         # [1, 1, C]
-    cell_y0_3d = cell_y0.unsqueeze(0)         # [1, R, 1]
-    cell_y1_3d = cell_y1.unsqueeze(0)         # [1, R, 1]
-
-    # Overlap in x: max(0, min(macro_x1, cell_x1) - max(macro_x0, cell_x0))
-    overlap_x = torch.clamp(
-        torch.min(macro_x1_3d, cell_x1_3d) - torch.max(macro_x0_3d, cell_x0_3d),
+    # Overlap in x: [N, 1] vs [C] → [N, C]
+    ov_x = torch.clamp(
+        torch.min(x1, cell_x1.unsqueeze(0)) - torch.max(x0, cell_x0.unsqueeze(0)),
         min=0.0,
-    )  # [N, R, C]  — clamp keeps the zero floor differentiable via relu gradient
-
-    # Overlap in y: max(0, min(macro_y1, cell_y1) - max(macro_y0, cell_y0))
-    overlap_y = torch.clamp(
-        torch.min(macro_y1_3d, cell_y1_3d) - torch.max(macro_y0_3d, cell_y0_3d),
+    )
+    # Overlap in y: [N, 1] vs [R] → [N, R]
+    ov_y = torch.clamp(
+        torch.min(y1, cell_y1.unsqueeze(0)) - torch.max(y0, cell_y0.unsqueeze(0)),
         min=0.0,
-    )  # [N, R, C]
+    )
 
-    overlap_area = overlap_x * overlap_y      # [N, R, C]
+    # Overlap area per (macro, row, col): [N, R, C] via outer product over R and C
+    overlap_area = ov_y.unsqueeze(2) * ov_x.unsqueeze(1)  # [N, R, C]
 
-    # --- per-cell density ---
-    # Sum contributions from all macros, normalise by cell area → [R, C]
-    per_cell_density = overlap_area.sum(dim=0) / cell_area  # [R, C]
+    # Per-cell density: sum over macros, normalise by cell area → [R, C]
+    per_cell_density = overlap_area.sum(dim=0) / cell_area
 
-    # --- top-k LSE matching ground truth formula ---
-    flat = per_cell_density.reshape(-1)       # [R*C]
+    flat = per_cell_density.reshape(-1)   # [R*C]
+    k = max(1, math.floor(total_cells * 0.1))
+    top_vals, _ = torch.topk(flat, k)    # k largest (zeros included if needed)
 
-    # Ground truth: sort non-zero cells descending, take top floor(total*0.1).
-    # k is computed from total cells (including zeros), matching plc_client_os.
-    k = max(1, int(flat.numel() * 0.1))
-
-    # Select top-k values — differentiable via torch.topk.
-    top_vals, _ = torch.topk(flat, k)         # [k], descending
-
-    # Log-sum-exp over top-k: smooth approximation to mean(top_k).
-    # Avoids the sparsity/whack-a-mole problem of a hard mean while
-    # staying close to the ground truth formula.
-    # γ=10: tight enough to closely track the top cells.
-    gamma = 10.0
-    density_cost = 0.5 * torch.logsumexp(gamma * top_vals, dim=0) / gamma
-
-    return density_cost
+    return 0.5 * top_vals.mean()
 
 
 class GradientPlacer:
@@ -195,7 +169,7 @@ class GradientPlacer:
     def __init__(
         self,
         lr: float = 0.01,
-        num_steps: int = 9000,
+        num_steps: int = 1000,
         verbose: bool = False,
     ):
         self.lr = lr
@@ -221,6 +195,16 @@ class GradientPlacer:
         )  # [N] bool
 
         sizes = benchmark.macro_sizes.float()  # fixed, no grad
+
+        # Print density cost at start (initial positions).
+        with torch.no_grad():
+            d0 = _density_cost(
+                placement,
+                sizes,
+                benchmark.canvas_width, benchmark.canvas_height,
+                benchmark.grid_rows, benchmark.grid_cols,
+            )
+        print(f"  density_cost  start={d0.item():.6f}")
 
         # Canvas bounds for clamping — computed only for hard macros, then filtered to movable.
         hard_half_w = sizes[:benchmark.num_hard_macros, 0] / 2.0
@@ -276,5 +260,15 @@ class GradientPlacer:
         # Restore fixed macros to their original positions.
         fixed_mask = benchmark.macro_fixed
         placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
+
+        # Print density cost at end on the final placement (all macros: hard + soft).
+        with torch.no_grad():
+            d1 = _density_cost(
+                placement,
+                sizes,
+                benchmark.canvas_width, benchmark.canvas_height,
+                benchmark.grid_rows, benchmark.grid_cols,
+            )
+        print(f"  density_cost  end  ={d1.item():.6f}  delta={d1.item()-d0.item():+.6f}")
 
         return placement
