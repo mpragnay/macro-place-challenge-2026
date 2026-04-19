@@ -1,16 +1,12 @@
 """
-Gradient Placer - Differentiable Density Optimization
+Gradient Placer - SA Congestion + Gradient Overlap Fine-tuning
 
-Optimizes macro positions by backpropagating through a differentiable
-density cost. Uses the same grid-based density formula as the ground
-truth evaluator:
+Phase 1: Simulated Annealing targeting congestion cost using the
+         ground-truth plc evaluator with tiny perturbations (~0.01µm).
+Phase 2: Gradient descent on differentiable overlap loss to resolve
+         any remaining macro overlaps.
 
-    density_cost = 0.5 * mean(top 10% of per-cell density values)
-
-where per-cell density = sum of macro overlap areas with that cell / cell area.
-
-All operations use torch.max / torch.min so gradients flow cleanly
-through autograd.
+Logs proxy_cost and individual cost terms throughout.
 
 Usage:
     uv run evaluate submissions/gradient_placer.py -b ibm01
@@ -18,7 +14,252 @@ Usage:
 """
 
 import torch
+import math
+import os
+import glob
+import numpy as np
 from macro_place.benchmark import Benchmark
+from macro_place.loader import load_benchmark, load_benchmark_from_dir
+from macro_place.objective import compute_proxy_cost
+
+
+# ── RUDY Congestion Proxy ─────────────────────────────────────────────────────
+
+class RudyPrecompute:
+    """
+    Pre-splits nets into fixed (no movable hard macros) vs variable (has at
+    least one movable hard macro), and pre-computes the fixed contribution to
+    the RUDY map.  Call once; then use in the training loop cheaply.
+
+    The variable-net contribution is fully vectorized via scatter_reduce +
+    batch matmul, so each forward+backward pass is O(N_var × (G+C)) tensor
+    ops with no Python loop.
+    """
+
+    def __init__(
+        self,
+        benchmark: Benchmark,
+        movable_mask: torch.Tensor,
+        *,
+        pin_weight: bool = False,
+    ):
+        """
+        Args:
+            pin_weight: if True, scale each net's demand by (pin_count - 1),
+                        giving multi-pin nets proportionally more routing weight.
+        """
+        G = benchmark.grid_rows
+        C = benchmark.grid_cols
+        W = benchmark.canvas_width
+        H_canvas = benchmark.canvas_height
+        self.G = G
+        self.C = C
+        self.cell_w = W / C
+        self.cell_h = H_canvas / G
+        self.grid_h_routes = self.cell_h * benchmark.hroutes_per_micron
+        self.grid_v_routes = self.cell_w * benchmark.vroutes_per_micron
+        self.pin_weight = pin_weight
+
+        port_pos = benchmark.port_positions.float()
+        self.has_ports = port_pos.shape[0] > 0
+        self.port_positions = port_pos
+        self.num_macros = benchmark.num_macros
+
+        movable_idx_set = set(movable_mask.nonzero(as_tuple=True)[0].tolist())
+
+        # Grid edges
+        self.cell_x_lo = torch.arange(C, dtype=torch.float32) * self.cell_w
+        self.cell_x_hi = self.cell_x_lo + self.cell_w
+        self.cell_y_lo = torch.arange(G, dtype=torch.float32) * self.cell_h
+        self.cell_y_hi = self.cell_y_lo + self.cell_h
+
+        # Split into fixed / variable nets + record pin counts
+        fixed_nets_nodes = []
+        variable_nets_nodes = []
+        var_pin_counts = []
+        for net_nodes in benchmark.net_nodes:
+            has_movable = any(n.item() in movable_idx_set for n in net_nodes)
+            if has_movable:
+                variable_nets_nodes.append(net_nodes)
+                var_pin_counts.append(len(net_nodes))
+            else:
+                fixed_nets_nodes.append(net_nodes)
+
+        # ── Pre-compute fixed map (no autograd needed) ──
+        if self.has_ports:
+            fixed_all_pos = torch.cat(
+                [benchmark.macro_positions.float(), port_pos], dim=0
+            )
+        else:
+            fixed_all_pos = benchmark.macro_positions.float()
+
+        H_fixed, V_fixed = self._build_rudy_map(
+            fixed_all_pos, fixed_nets_nodes, requires_grad=False
+        )
+        self.H_fixed = H_fixed  # [G, C]
+        self.V_fixed = V_fixed  # [G, C]
+
+        # ── Build flat index arrays for variable nets ──
+        N_var = len(variable_nets_nodes)
+        self.N_var = N_var
+        flat_indices = []
+        net_ids_flat = []
+        for i, nodes in enumerate(variable_nets_nodes):
+            flat_indices.append(nodes)
+            net_ids_flat.append(torch.full((len(nodes),), i, dtype=torch.long))
+
+        if N_var > 0:
+            self.flat_node_indices = torch.cat(flat_indices)
+            self.net_ids_flat = torch.cat(net_ids_flat)
+            # (pin_count - 1) weights, clamped to at least 1
+            pc = torch.tensor(var_pin_counts, dtype=torch.float32)
+            self.pin_counts = (pc - 1.0).clamp(min=1.0)  # [N_var]
+        else:
+            self.flat_node_indices = torch.zeros(0, dtype=torch.long)
+            self.net_ids_flat = torch.zeros(0, dtype=torch.long)
+            self.pin_counts = torch.zeros(0, dtype=torch.float32)
+
+    def _build_rudy_map(self, all_pos, nets_list, *, requires_grad=False):
+        """Compute H_util and V_util via Python loop (used for fixed nets once)."""
+        G, C = self.G, self.C
+        # Clamp bbox to cell size — caps density at 1/cell_area, avoids explosion
+        min_w = self.cell_w
+        min_h = self.cell_h
+        H_util = torch.zeros(G, C)
+        V_util = torch.zeros(G, C)
+        for net_nodes in nets_list:
+            node_pos = all_pos[net_nodes]
+            x_min = node_pos[:, 0].min().item()
+            x_max = node_pos[:, 0].max().item()
+            y_min = node_pos[:, 1].min().item()
+            y_max = node_pos[:, 1].max().item()
+            bbox_w = max(x_max - x_min, min_w)
+            bbox_h = max(y_max - y_min, min_h)
+            w = max(len(net_nodes) - 1, 1) if self.pin_weight else 1.0
+            ol_x = torch.clamp(
+                torch.minimum(self.cell_x_hi, torch.tensor(x_max))
+                - torch.maximum(self.cell_x_lo, torch.tensor(x_min)),
+                min=0.0,
+            )
+            ol_y = torch.clamp(
+                torch.minimum(self.cell_y_hi, torch.tensor(y_max))
+                - torch.maximum(self.cell_y_lo, torch.tensor(y_min)),
+                min=0.0,
+            )
+            outer = ol_y[:, None] * ol_x[None, :]
+            H_util = H_util + w * outer / (bbox_h * self.grid_h_routes)
+            V_util = V_util + w * outer / (bbox_w * self.grid_v_routes)
+        return H_util, V_util
+
+    def compute(
+        self,
+        positions: torch.Tensor,
+        *,
+        temperature: float = 20.0,
+        top_frac: float = 0.05,
+    ) -> torch.Tensor:
+        """
+        Differentiable RUDY congestion proxy (smooth abu top-5%).
+
+        Normalization (option 3+4 from user analysis):
+          - bbox clamped to cell_w/cell_h floor → caps density at 1/cell_area
+          - H/V separated with capacity normalization
+          - optional (pin_count - 1) weighting
+
+        Variable nets: scatter_reduce (batched min/max) + batch matmul.
+        """
+        device = positions.device
+        dtype = positions.dtype
+        N_var = self.N_var
+        G, C = self.G, self.C
+
+        H_util = self.H_fixed.to(device=device, dtype=dtype)
+        V_util = self.V_fixed.to(device=device, dtype=dtype)
+
+        if N_var > 0:
+            if self.has_ports:
+                port_pos = self.port_positions.to(device=device, dtype=dtype)
+                all_pos = torch.cat([positions, port_pos], dim=0)
+            else:
+                all_pos = positions
+
+            flat_idx = self.flat_node_indices.to(device)
+            net_ids = self.net_ids_flat.to(device)
+
+            flat_pos = all_pos[flat_idx]  # [total_nodes, 2]
+            flat_x = flat_pos[:, 0]
+            flat_y = flat_pos[:, 1]
+
+            NEG_INF = torch.full((N_var,), -1e9, dtype=dtype, device=device)
+            POS_INF = torch.full((N_var,), +1e9, dtype=dtype, device=device)
+
+            x_max = NEG_INF.scatter_reduce(0, net_ids, flat_x, reduce='amax', include_self=True)
+            x_min = POS_INF.scatter_reduce(0, net_ids, flat_x, reduce='amin', include_self=True)
+            y_max = NEG_INF.scatter_reduce(0, net_ids, flat_y, reduce='amax', include_self=True)
+            y_min = POS_INF.scatter_reduce(0, net_ids, flat_y, reduce='amin', include_self=True)
+
+            # Clamp to cell size (option 1/3: cap density at 1/cell_area)
+            bbox_w = (x_max - x_min).clamp(min=self.cell_w)  # [N_var]
+            bbox_h = (y_max - y_min).clamp(min=self.cell_h)  # [N_var]
+
+            cell_x_lo = self.cell_x_lo.to(device=device, dtype=dtype)
+            cell_x_hi = self.cell_x_hi.to(device=device, dtype=dtype)
+            cell_y_lo = self.cell_y_lo.to(device=device, dtype=dtype)
+            cell_y_hi = self.cell_y_hi.to(device=device, dtype=dtype)
+
+            ol_x = torch.clamp(
+                torch.minimum(cell_x_hi[:, None], x_max[None, :])
+                - torch.maximum(cell_x_lo[:, None], x_min[None, :]),
+                min=0.0,
+            )  # [C, N_var]
+            ol_y = torch.clamp(
+                torch.minimum(cell_y_hi[:, None], y_max[None, :])
+                - torch.maximum(cell_y_lo[:, None], y_min[None, :]),
+                min=0.0,
+            )  # [G, N_var]
+
+            # Pin-count weights (option 2)
+            if self.pin_weight:
+                pc = self.pin_counts.to(device=device, dtype=dtype)  # [N_var]
+            else:
+                pc = torch.ones(N_var, dtype=dtype, device=device)
+
+            h_coeff = pc / (bbox_h * self.grid_h_routes)  # [N_var]
+            v_coeff = pc / (bbox_w * self.grid_v_routes)  # [N_var]
+
+            H_util = H_util + ol_y @ (ol_x * h_coeff[None, :]).T   # [G,C]
+            V_util = V_util + ol_y @ (ol_x * v_coeff[None, :]).T   # [G,C]
+
+        combined = torch.cat([H_util.flatten(), V_util.flatten()])
+        k = max(1, int(combined.numel() * top_frac))
+        top_vals, _ = torch.topk(combined, k)
+        loss = torch.logsumexp(temperature * top_vals, dim=0) / temperature
+        return loss
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _find_and_load_plc(benchmark: Benchmark):
+    """Reconstruct plc from benchmark name by searching known directories."""
+    name = benchmark.name
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.path.join(base, "external/MacroPlacement/Testcases/ICCAD04", name),
+    ]
+    ng45_base = os.path.join(base, "external/MacroPlacement/Testcases")
+    for design_dir in glob.glob(os.path.join(ng45_base, "*/NanGate45")):
+        parent = os.path.basename(os.path.dirname(design_dir))
+        if parent.startswith(name) or name.endswith("_ng45"):
+            candidates.append(design_dir)
+    for d in candidates:
+        netlist = os.path.join(d, "netlist.pb.txt")
+        if os.path.exists(netlist):
+            plc_file = os.path.join(d, "initial.plc")
+            if not os.path.exists(plc_file):
+                plc_file = None
+            _, plc = load_benchmark(netlist, plc_file, name=name)
+            return plc
+    return None
 
 
 def _overlap_loss(
@@ -29,252 +270,524 @@ def _overlap_loss(
 ) -> torch.Tensor:
     """
     Differentiable pairwise overlap loss over hard macros only.
-
-    For each pair (i, j) of hard macros:
-        overlap_x = clamp(half_w_i + half_w_j + eps - |x_i - x_j|, min=0)
-        overlap_y = clamp(half_h_i + half_h_j + eps - |y_i - y_j|, min=0)
-        loss += overlap_x * overlap_y
-
-    The eps margin forces macros to stay at least eps microns apart, which
-    keeps the loss (and its gradient) above float32 underflow even when
-    macros are nearly touching. Without eps, near-touching pairs produce
-    overlap areas ~1e-13 um², which underflow to zero when squared.
-
-    Args:
-        positions:  [N, 2] macro centers (requires_grad on movable subset)
-        sizes:      [N, 2] macro (width, height), fixed
-        num_hard:   number of hard macros (first num_hard rows used)
-        eps:        minimum required separation in microns (default 0.1)
-
-    Returns:
-        Scalar total overlap loss (sum over all pairs within eps of each other).
     """
-    pos  = positions[:num_hard]          # [H, 2]
-    sz   = sizes[:num_hard]              # [H, 2]
-    hw   = sz[:, 0] / 2.0               # half-widths  [H]
-    hh   = sz[:, 1] / 2.0               # half-heights [H]
+    pos = positions[:num_hard]
+    sz = sizes[:num_hard]
+    hw = sz[:, 0] / 2.0
+    hh = sz[:, 1] / 2.0
 
-    # Pairwise distance in x and y: [H, H]
-    dx = pos[:, 0].unsqueeze(1) - pos[:, 0].unsqueeze(0)   # x_i - x_j
-    dy = pos[:, 1].unsqueeze(1) - pos[:, 1].unsqueeze(0)   # y_i - y_j
+    dx = pos[:, 0].unsqueeze(1) - pos[:, 0].unsqueeze(0)
+    dy = pos[:, 1].unsqueeze(1) - pos[:, 1].unsqueeze(0)
 
-    # Minimum separation required: sum of half-sizes + margin
-    min_sep_x = hw.unsqueeze(1) + hw.unsqueeze(0) + eps    # [H, H]
-    min_sep_y = hh.unsqueeze(1) + hh.unsqueeze(0) + eps    # [H, H]
+    min_sep_x = hw.unsqueeze(1) + hw.unsqueeze(0) + eps
+    min_sep_y = hh.unsqueeze(1) + hh.unsqueeze(0) + eps
 
-    # Overlap amount: positive when boxes are within eps of each other
-    overlap_x = torch.clamp(min_sep_x - dx.abs(), min=0.0)  # [H, H]
-    overlap_y = torch.clamp(min_sep_y - dy.abs(), min=0.0)  # [H, H]
+    overlap_x = torch.clamp(min_sep_x - dx.abs(), min=0.0)
+    overlap_y = torch.clamp(min_sep_y - dy.abs(), min=0.0)
 
-    # Sum upper triangle only (each pair counted once).
-    mask = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool, device=positions.device), diagonal=1)
+    mask = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool,
+                                 device=positions.device), diagonal=1)
     return (overlap_x * overlap_y)[mask].sum()
 
 
-def _density_cost(
-    positions: torch.Tensor,
+def _get_congestion_cost_only(plc, placement, benchmark):
+    """Evaluate only congestion cost (faster than full proxy)."""
+    from macro_place.objective import _set_placement
+    _set_placement(plc, placement, benchmark)
+    return plc.get_congestion_cost()
+
+
+def _update_single_macro(plc, benchmark, tensor_idx, x, y):
+    """
+    Update only one macro + its pins in the plc, then mark congestion dirty.
+    Much faster than _set_placement which updates ALL macros.
+    """
+    num_hard = benchmark.num_hard_macros
+    if tensor_idx < num_hard:
+        macro_plc_idx = benchmark.hard_macro_indices[tensor_idx]
+    else:
+        macro_plc_idx = benchmark.soft_macro_indices[tensor_idx - num_hard]
+
+    node = plc.modules_w_pins[macro_plc_idx]
+    node.set_pos(x, y)
+
+    # Build pin map cache if needed
+    if not hasattr(plc, '_macro_pin_map'):
+        pin_map = {}
+        for idx, mod in enumerate(plc.modules_w_pins):
+            if mod.get_type() == 'MACRO_PIN' and hasattr(mod, 'get_macro_name'):
+                name = mod.get_macro_name()
+                if name not in pin_map:
+                    pin_map[name] = []
+                pin_map[name].append(idx)
+        plc._macro_pin_map = pin_map
+
+    for pin_idx in plc._macro_pin_map.get(node.get_name(), []):
+        pin = plc.modules_w_pins[pin_idx]
+        pin.set_pos(x + pin.x_offset, y + pin.y_offset)
+
+    plc.FLAG_UPDATE_CONGESTION = True
+
+
+# ── Phase 1: Simulated Annealing on Congestion ──────────────────────────────
+
+def _sa_congestion(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    plc,
+    movable_indices: torch.Tensor,
     sizes: torch.Tensor,
-    canvas_width: float,
-    canvas_height: float,
-    grid_rows: int,
-    grid_cols: int,
+    *,
+    num_iters: int = 2000,
+    T0: float = 0.0005,
+    T_min: float = 1e-7,
+    alpha: float = 0.995,
+    perturbation_start: float = 2.0,
+    perturbation_end: float = 0.1,
+    log_interval: int = 50,
 ) -> torch.Tensor:
     """
-    Differentiable density cost.
-
-    Uses log-sum-exp over all grid cells as a smooth surrogate for the top-k
-    density cost. LSE has nonzero gradient everywhere (unlike mean, which is
-    constant w.r.t. position for fully in-canvas macros) and naturally
-    emphasises the hottest cells (like top-k) without hard selection.
-
-    Per-cell density = sum of clamped overlap areas between each macro
-    and the cell, divided by cell area.
-
-    All intermediate ops use torch.min / torch.max so autograd can
-    differentiate through them w.r.t. positions.
+    Simulated annealing that minimises congestion cost via small perturbations.
 
     Args:
-        positions:      [N, 2] macro center (x, y) — must have requires_grad
-        sizes:          [N, 2] macro (width, height) — fixed, no grad needed
-        canvas_width:   canvas width in microns
-        canvas_height:  canvas height in microns
-        grid_rows:      number of grid rows
-        grid_cols:      number of grid columns
-        top_k_fraction: fraction of cells used for averaging (default 0.1 = top 10%)
+        placement:       [N, 2] current positions
+        benchmark:       Benchmark object
+        plc:             PlacementCost object for ground-truth congestion eval
+        movable_indices: [M] indices of movable hard macros
+        sizes:           [N, 2] macro sizes
+        num_iters:       SA iterations
+        T0:              initial temperature
+        T_min:           minimum temperature floor
+        alpha:           geometric cooling factor
+        perturbation_start: initial perturbation scale (µm)
+        perturbation_end:   final perturbation scale (µm)
+        log_interval:    print every N steps
 
     Returns:
-        Scalar density cost tensor (differentiable w.r.t. positions).
+        Optimised [N, 2] placement tensor.
     """
-    N = positions.shape[0]
-    cell_w = canvas_width / grid_cols   # width of one grid cell
-    cell_h = canvas_height / grid_rows  # height of one grid cell
-    cell_area = cell_w * cell_h
+    best = placement.clone()
+    current = placement.clone()
 
-    # --- macro bounding boxes ---
-    # [N, 1]: left / right / bottom / top edges of each macro
-    half_w = sizes[:, 0:1] / 2.0   # [N, 1]
-    half_h = sizes[:, 1:2] / 2.0   # [N, 1]
-    macro_x0 = positions[:, 0:1] - half_w  # [N, 1]
-    macro_x1 = positions[:, 0:1] + half_w  # [N, 1]
-    macro_y0 = positions[:, 1:2] - half_h  # [N, 1]
-    macro_y1 = positions[:, 1:2] + half_h  # [N, 1]
+    # Canvas bounds per movable macro
+    half_w = sizes[movable_indices, 0] / 2.0
+    half_h = sizes[movable_indices, 1] / 2.0
+    x_lo = half_w
+    x_hi = benchmark.canvas_width - half_w
+    y_lo = half_h
+    y_hi = benchmark.canvas_height - half_h
 
-    # --- grid cell bounding boxes ---
-    # col_idx: [1, grid_cols], row_idx: [grid_rows, 1]
-    col_idx = torch.arange(grid_cols, dtype=positions.dtype, device=positions.device).unsqueeze(0)  # [1, C]
-    row_idx = torch.arange(grid_rows, dtype=positions.dtype, device=positions.device).unsqueeze(1)  # [R, 1]
+    # Baseline costs
+    from macro_place.objective import _set_placement
+    _set_placement(plc, current, benchmark)
+    base_costs = compute_proxy_cost(current, benchmark, plc)
+    current_cong = base_costs["congestion_cost"]
+    best_cong = current_cong
 
-    cell_x0 = col_idx * cell_w                # [1, C]
-    cell_x1 = cell_x0 + cell_w                # [1, C]
-    cell_y0 = row_idx * cell_h                # [R, 1]
-    cell_y1 = cell_y0 + cell_h                # [R, 1]
+    print(f"\n  ── SA Phase: Congestion Optimisation ({num_iters} iters) ──")
+    print(f"  Initial: proxy={base_costs['proxy_cost']:.6f}  "
+          f"wl={base_costs['wirelength_cost']:.6f}  "
+          f"den={base_costs['density_cost']:.6f}  "
+          f"cong={base_costs['congestion_cost']:.6f}")
+    print(f"  {'Step':>6}  {'T':>10}  {'Scale':>8}  {'Cong':>10}  "
+          f"{'Best':>10}  {'Accept':>6}  {'Macro':>6}")
 
-    # --- overlap area: macro i with each grid cell (r, c) ---
-    # Broadcast to [N, R, C] by inserting dims appropriately.
-    # macro tensors: [N, 1, 1], cell tensors: [1, R, C]
-    macro_x0_3d = macro_x0.unsqueeze(2)       # [N, 1, 1]
-    macro_x1_3d = macro_x1.unsqueeze(2)       # [N, 1, 1]
-    macro_y0_3d = macro_y0.unsqueeze(2)       # [N, 1, 1]
-    macro_y1_3d = macro_y1.unsqueeze(2)       # [N, 1, 1]
+    T = T0
+    n_accept = 0
+    n_moves = len(movable_indices)
 
-    cell_x0_3d = cell_x0.unsqueeze(0)         # [1, 1, C]
-    cell_x1_3d = cell_x1.unsqueeze(0)         # [1, 1, C]
-    cell_y0_3d = cell_y0.unsqueeze(0)         # [1, R, 1]
-    cell_y1_3d = cell_y1.unsqueeze(0)         # [1, R, 1]
+    for step in range(num_iters):
+        # Linearly decay perturbation scale
+        frac = step / max(num_iters - 1, 1)
+        scale = perturbation_start + (perturbation_end - perturbation_start) * frac
 
-    # Overlap in x: max(0, min(macro_x1, cell_x1) - max(macro_x0, cell_x0))
-    overlap_x = torch.clamp(
-        torch.min(macro_x1_3d, cell_x1_3d) - torch.max(macro_x0_3d, cell_x0_3d),
-        min=0.0,
-    )  # [N, R, C]  — clamp keeps the zero floor differentiable via relu gradient
+        # Pick a random movable macro
+        mi = torch.randint(n_moves, (1,)).item()
+        macro_idx = movable_indices[mi].item()
 
-    # Overlap in y: max(0, min(macro_y1, cell_y1) - max(macro_y0, cell_y0))
-    overlap_y = torch.clamp(
-        torch.min(macro_y1_3d, cell_y1_3d) - torch.max(macro_y0_3d, cell_y0_3d),
-        min=0.0,
-    )  # [N, R, C]
+        # Save old position
+        old_x = current[macro_idx, 0].item()
+        old_y = current[macro_idx, 1].item()
 
-    overlap_area = overlap_x * overlap_y      # [N, R, C]
+        # Perturb
+        dx = torch.randn(1).item() * scale
+        dy = torch.randn(1).item() * scale
+        new_x = max(x_lo[mi].item(), min(x_hi[mi].item(), old_x + dx))
+        new_y = max(y_lo[mi].item(), min(y_hi[mi].item(), old_y + dy))
 
-    # --- per-cell density ---
-    # Sum contributions from all macros, normalise by cell area → [R, C]
-    per_cell_density = overlap_area.sum(dim=0) / cell_area  # [R, C]
+        # Update only this macro in plc
+        _update_single_macro(plc, benchmark, macro_idx, new_x, new_y)
+        trial_cong = plc.get_congestion_cost()
+        delta = trial_cong - current_cong
 
-    # --- top-k LSE matching ground truth formula ---
-    flat = per_cell_density.reshape(-1)       # [R*C]
+        # Accept / reject
+        accepted = False
+        if delta < 0:
+            accepted = True
+        elif T > 0:
+            p = math.exp(-delta / T) if delta / T < 500 else 0.0
+            if torch.rand(1).item() < p:
+                accepted = True
 
-    # Ground truth: sort non-zero cells descending, take top floor(total*0.1).
-    # k is computed from total cells (including zeros), matching plc_client_os.
-    k = max(1, int(flat.numel() * 0.1))
+        if accepted:
+            current[macro_idx, 0] = new_x
+            current[macro_idx, 1] = new_y
+            current_cong = trial_cong
+            n_accept += 1
+            if trial_cong < best_cong:
+                best = current.clone()
+                best_cong = trial_cong
+        else:
+            # Revert the macro in plc
+            _update_single_macro(plc, benchmark, macro_idx, old_x, old_y)
 
-    # Select top-k values — differentiable via torch.topk.
-    top_vals, _ = torch.topk(flat, k)         # [k], descending
+        # Cool
+        T = max(T * alpha, T_min)
 
-    # Log-sum-exp over top-k: smooth approximation to mean(top_k).
-    # Avoids the sparsity/whack-a-mole problem of a hard mean while
-    # staying close to the ground truth formula.
-    # γ=10: tight enough to closely track the top cells.
-    gamma = 10.0
-    density_cost = 0.5 * torch.logsumexp(gamma * top_vals, dim=0) / gamma
+        # Log
+        if step % log_interval == 0 or step == num_iters - 1:
+            print(f"  {step:>6}  {T:>10.6f}  {scale:>6.3f}µm  "
+                  f"{current_cong:>10.6f}  {best_cong:>10.6f}  "
+                  f"{n_accept:>6}  {macro_idx:>6}")
 
-    return density_cost
+    # Final cost summary
+    final_costs = compute_proxy_cost(best, benchmark, plc)
+    print(f"\n  SA result: proxy={final_costs['proxy_cost']:.6f}  "
+          f"wl={final_costs['wirelength_cost']:.6f}  "
+          f"den={final_costs['density_cost']:.6f}  "
+          f"cong={final_costs['congestion_cost']:.6f}  "
+          f"overlaps={final_costs['overlap_count']}")
+    print(f"  Accepted {n_accept}/{num_iters} moves "
+          f"({100*n_accept/max(num_iters,1):.1f}%)")
 
+    return best
+
+
+# ── Phase 2: Greedy Congestion Local Search ──────────────────────────────────
+
+def _greedy_congestion_search(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    plc,
+    movable_indices: torch.Tensor,
+    sizes: torch.Tensor,
+    *,
+    num_rounds: int = 10,
+    trials_per_macro: int = 10,
+    top_k_macros: int = 10,
+    perturbation: float = 0.01,
+    log_interval: int = 1,
+) -> torch.Tensor:
+    """
+    Greedy local search on congestion cost, RUDY-gradient-directed.
+
+    Each round:
+      1. Rank movable macros by their cell's congestion (hottest first).
+      2. For each top-k macro, compute the RUDY gradient at its position.
+      3. Propose moves along the negative gradient direction at a few step
+         sizes; also try a few random perturbations as fallback.
+      4. Accept any move that strictly improves ground-truth congestion.
+
+    Using the RUDY gradient as a proposal direction is better than pure
+    random because even with correlation 0.52 the gradient points away from
+    high-demand regions more often than a random vector would.
+
+    Args:
+        perturbation:    base step size in microns
+        num_rounds:      passes over the hot-macro list
+        trials_per_macro: gradient step sizes to try + random fallbacks
+        top_k_macros:    only perturb the top-k hottest macros per round
+    """
+    from macro_place.objective import _set_placement
+
+    current = placement.clone()
+    _set_placement(plc, current, benchmark)
+    current_cong = plc.get_congestion_cost()
+    best_cong = current_cong
+    best = current.clone()
+
+    # Canvas bounds per movable macro
+    half_w = sizes[movable_indices, 0] / 2.0
+    half_h = sizes[movable_indices, 1] / 2.0
+    x_lo = half_w
+    x_hi = benchmark.canvas_width - half_w
+    y_lo = half_h
+    y_hi = benchmark.canvas_height - half_h
+
+    grid_w = benchmark.canvas_width / benchmark.grid_cols
+    grid_h = benchmark.canvas_height / benchmark.grid_rows
+    n_moves = len(movable_indices)
+    num_hard = benchmark.num_hard_macros
+
+    # Pre-build RUDY helper (fixed nets pre-computed once)
+    movable_mask = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
+    rudy = RudyPrecompute(benchmark, movable_mask)
+
+    # Step sizes to try along gradient direction (multipliers of perturbation)
+    grad_scales = [1.0, 2.0, 0.5]
+    n_random = max(1, trials_per_macro - len(grad_scales))
+
+    print(f"\n  ── Greedy Congestion Search ({num_rounds} rounds, "
+          f"top_k={top_k_macros}, {len(grad_scales)} grad + {n_random} rand trials, "
+          f"σ={perturbation}µm) ──")
+    print(f"  Initial congestion: {current_cong:.6f}")
+
+    total_improvements = 0
+
+    for rnd in range(num_rounds):
+        # Compute per-cell congestion map and score each macro
+        plc.get_routing()
+        H_cong = list(plc.H_routing_cong)
+        V_cong = list(plc.V_routing_cong)
+
+        macro_scores = []
+        for mi in range(n_moves):
+            macro_idx = movable_indices[mi].item()
+            x = current[macro_idx, 0].item()
+            y = current[macro_idx, 1].item()
+            col = min(int(x / grid_w), benchmark.grid_cols - 1)
+            row = min(int(y / grid_h), benchmark.grid_rows - 1)
+            cell = row * benchmark.grid_cols + col
+            macro_scores.append((H_cong[cell] + V_cong[cell], mi))
+
+        macro_scores.sort(reverse=True)
+        top_macros = macro_scores[:top_k_macros]
+
+        n_improved = 0
+        for score, mi in top_macros:
+            macro_idx = movable_indices[mi].item()
+            old_x = current[macro_idx, 0].item()
+            old_y = current[macro_idx, 1].item()
+
+            # ── Compute RUDY gradient for this macro ──
+            pos_req = current.clone().requires_grad_(True)
+            soft_pos = current[num_hard:].detach()
+            full_pos = torch.cat([pos_req[:num_hard], soft_pos], dim=0)
+            rudy_loss = rudy.compute(full_pos, temperature=20.0, top_frac=0.05)
+            rudy_loss.backward()
+            grad = pos_req.grad[macro_idx]  # [2]: (dx, dy)
+            grad_norm = grad.norm().item()
+
+            # Normalised negative gradient direction (move away from high RUDY)
+            if grad_norm > 1e-8:
+                gx = -grad[0].item() / grad_norm
+                gy = -grad[1].item() / grad_norm
+            else:
+                gx, gy = 0.0, 0.0
+
+            # Build candidate moves: gradient-directed first, then random
+            candidates = []
+            for scale in grad_scales:
+                step = perturbation * scale
+                candidates.append((old_x + gx * step, old_y + gy * step))
+            for _ in range(n_random):
+                dx = torch.randn(1).item() * perturbation
+                dy = torch.randn(1).item() * perturbation
+                candidates.append((old_x + dx, old_y + dy))
+
+            for cx, cy in candidates:
+                new_x = max(x_lo[mi].item(), min(x_hi[mi].item(), cx))
+                new_y = max(y_lo[mi].item(), min(y_hi[mi].item(), cy))
+
+                _update_single_macro(plc, benchmark, macro_idx, new_x, new_y)
+                trial_cong = plc.get_congestion_cost()
+
+                if trial_cong < current_cong:
+                    current[macro_idx, 0] = new_x
+                    current[macro_idx, 1] = new_y
+                    current_cong = trial_cong
+                    old_x, old_y = new_x, new_y
+                    n_improved += 1
+                    if trial_cong < best_cong:
+                        best = current.clone()
+                        best_cong = trial_cong
+                else:
+                    _update_single_macro(plc, benchmark, macro_idx, old_x, old_y)
+
+        total_improvements += n_improved
+        if rnd % log_interval == 0 or rnd == num_rounds - 1:
+            print(f"  round {rnd+1:3d}/{num_rounds}  cong={current_cong:.6f}  "
+                  f"best={best_cong:.6f}  improved={n_improved} macros")
+
+    print(f"  Total improvements: {total_improvements} across {num_rounds} rounds")
+    return best
+
+
+# ── Phase 3: Gradient Overlap Fine-tuning ────────────────────────────────────
+
+def _gradient_overlap_finetune(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    sizes: torch.Tensor,
+    movable: torch.Tensor,
+    *,
+    lr: float = 0.01,
+    num_steps: int = 9000,
+    cong_weight: float = 0.0,
+    cong_temperature: float = 20.0,
+    log_interval: int = 500,
+) -> torch.Tensor:
+    """
+    Gradient descent on overlap loss (+ optional RUDY congestion) to resolve overlaps.
+
+    Args:
+        cong_weight:     Weight for RUDY congestion term (0 = disabled).
+        cong_temperature: logsumexp temperature for smooth abu(top-5%).
+    """
+    num_hard = benchmark.num_hard_macros
+
+    hard_half_w = sizes[:num_hard, 0] / 2.0
+    hard_half_h = sizes[:num_hard, 1] / 2.0
+    x_lo = hard_half_w
+    x_hi = torch.full_like(hard_half_w, benchmark.canvas_width) - hard_half_w
+    y_lo = hard_half_h
+    y_hi = torch.full_like(hard_half_h, benchmark.canvas_height) - hard_half_h
+
+    hard_movable = movable[:num_hard]
+    movable_idx = hard_movable.nonzero(as_tuple=True)[0]
+    hard_base = placement[:num_hard].detach()
+    hard_sizes = sizes[:num_hard]
+
+    free_pos = hard_base[hard_movable].clone().requires_grad_(True)
+    optimizer = torch.optim.Adam([free_pos], lr=lr)
+
+    # Pre-compute RUDY fixed contribution once (if congestion term enabled)
+    rudy = None
+    if cong_weight > 0.0:
+        print(f"  Pre-computing RUDY fixed contributions...")
+        rudy = RudyPrecompute(benchmark, movable)
+        print(f"  Variable nets: {rudy.N_var} / {benchmark.num_nets}")
+
+    print(f"\n  ── Overlap Fine-tuning Phase ({num_steps} steps, "
+          f"cong_weight={cong_weight}) ──")
+
+    # Full macro positions tensor (hard + soft) needed for RUDY
+    soft_base = placement[num_hard:].detach()
+
+    for step in range(num_steps):
+        optimizer.zero_grad()
+        full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)
+        overlap_loss = _overlap_loss(full_hard_pos, hard_sizes, num_hard)
+
+        if rudy is not None:
+            # Build full positions [num_macros, 2] for RUDY
+            full_pos = torch.cat([full_hard_pos, soft_base], dim=0)
+            cong_loss = rudy.compute(
+                full_pos,
+                temperature=cong_temperature,
+                top_frac=0.05,
+            )
+            loss = overlap_loss + cong_weight * cong_loss
+        else:
+            loss = overlap_loss
+            cong_loss = torch.tensor(0.0)
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            free_pos[:, 0] = torch.max(
+                torch.min(free_pos[:, 0], x_hi[hard_movable]),
+                x_lo[hard_movable])
+            free_pos[:, 1] = torch.max(
+                torch.min(free_pos[:, 1], y_hi[hard_movable]),
+                y_lo[hard_movable])
+
+        if step % log_interval == 0 or step == num_steps - 1:
+            print(f"  step {step:5d}  overlap={overlap_loss.item():.4e}  "
+                  f"rudy={cong_loss.item():.4f}")
+
+    with torch.no_grad():
+        placement[:num_hard][hard_movable] = free_pos
+
+    fixed_mask = benchmark.macro_fixed
+    placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
+
+    return placement
+
+
+# ── Main Placer ──────────────────────────────────────────────────────────────
 
 class GradientPlacer:
     """
-    Gradient-based macro placer using differentiable density cost.
-
-    Initialises from the benchmark's own initial positions (which are
-    near-optimal for wirelength but contain hard-macro overlaps) and
-    descends the density gradient to spread macros apart.
-
-    Only movable hard macros are optimised; fixed macros and soft macros
-    keep their initial positions throughout.
+    Three-phase placer:
+      1. Gradient descent on overlap loss
+      2. Greedy local search on congestion (tiny perturbations, ground-truth evaluator)
+      3. SA on congestion (optional, disabled by default)
     """
 
     def __init__(
         self,
+        sa_iters: int = 0,
+        overlap_steps: int = 9000,
         lr: float = 0.01,
-        num_steps: int = 9000,
+        cong_weight: float = 0.0,
+        cong_temperature: float = 20.0,
+        greedy_rounds: int = 20,
+        greedy_trials: int = 10,
+        greedy_top_k_macros: int = 10,
+        greedy_perturbation: float = 0.01,
         verbose: bool = False,
     ):
+        self.sa_iters = sa_iters
+        self.overlap_steps = overlap_steps
         self.lr = lr
-        self.num_steps = num_steps
+        self.cong_weight = cong_weight
+        self.cong_temperature = cong_temperature
+        self.greedy_rounds = greedy_rounds
+        self.greedy_trials = greedy_trials
+        self.greedy_top_k_macros = greedy_top_k_macros
+        self.greedy_perturbation = greedy_perturbation
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        """
-        Run gradient descent and return optimised placement.
-
-        Args:
-            benchmark: Benchmark with circuit data.
-
-        Returns:
-            [num_macros, 2] tensor of (x, y) center positions.
-        """
-        # Start from the benchmark's initial positions (connectivity-aware).
         placement = benchmark.macro_positions.clone().float()
+        sizes = benchmark.macro_sizes.float()
+        movable = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
+        movable_indices = movable.nonzero(as_tuple=True)[0]
 
-        # Mask of positions we are allowed to move.
-        movable = (
-            benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
-        )  # [N] bool
+        # ── Phase 1: Gradient overlap resolution ──
+        placement = _gradient_overlap_finetune(
+            placement, benchmark, sizes, movable,
+            lr=self.lr, num_steps=self.overlap_steps,
+            cong_weight=self.cong_weight,
+            cong_temperature=self.cong_temperature,
+        )
 
-        sizes = benchmark.macro_sizes.float()  # fixed, no grad
+        plc = _find_and_load_plc(benchmark)
+        if plc is None:
+            print(f"  [WARN] Could not load plc for {benchmark.name}, skipping congestion phases")
+            return placement
 
-        # Canvas bounds for clamping — computed only for hard macros, then filtered to movable.
-        hard_half_w = sizes[:benchmark.num_hard_macros, 0] / 2.0
-        hard_half_h = sizes[:benchmark.num_hard_macros, 1] / 2.0
-        x_lo = hard_half_w
-        x_hi = torch.full_like(hard_half_w, benchmark.canvas_width) - hard_half_w
-        y_lo = hard_half_h
-        y_hi = torch.full_like(hard_half_h, benchmark.canvas_height) - hard_half_h
+        costs = compute_proxy_cost(placement, benchmark, plc)
+        print(f"\n  Post-overlap: proxy={costs['proxy_cost']:.6f}  "
+              f"wl={costs['wirelength_cost']:.6f}  "
+              f"den={costs['density_cost']:.6f}  "
+              f"cong={costs['congestion_cost']:.6f}  "
+              f"overlaps={costs['overlap_count']}")
 
-        num_hard = benchmark.num_hard_macros
+        # ── Phase 2: Greedy congestion local search ──
+        if self.greedy_rounds > 0:
+            placement = _greedy_congestion_search(
+                placement, benchmark, plc, movable_indices, sizes,
+                num_rounds=self.greedy_rounds,
+                trials_per_macro=self.greedy_trials,
+                top_k_macros=self.greedy_top_k_macros,
+                perturbation=self.greedy_perturbation,
+            )
 
-        # Work only with hard macro rows — soft macros never enter the overlap loss.
-        hard_movable = movable[:num_hard]                          # [H] bool
-        movable_idx = hard_movable.nonzero(as_tuple=True)[0]      # [M] int indices
-        hard_base = placement[:num_hard].detach()                  # [H, 2] fixed reference
-        hard_sizes = sizes[:num_hard]                              # [H, 2]
+        # ── Phase 3: SA on congestion (optional) ──
+        if self.sa_iters > 0:
+            placement = _sa_congestion(
+                placement, benchmark, plc, movable_indices, sizes,
+                num_iters=self.sa_iters,
+            )
 
-        # Optimise only the movable positions as a free parameter.
-        free_pos = hard_base[hard_movable].clone().requires_grad_(True)  # [M, 2]
-        optimizer = torch.optim.Adam([free_pos], lr=self.lr)
-
-        for step in range(self.num_steps):
-            optimizer.zero_grad()
-
-            # index_put (non-inplace) builds a new [H, 2] tensor in the autograd graph
-            # without cloning the full [N, 2] placement each step.
-            full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)
-
-            loss = _overlap_loss(full_hard_pos, hard_sizes, num_hard)
-
-            loss.backward()
-            optimizer.step()
-
-            # Per-macro canvas clamp — use individual bounds, not global min/max,
-            # so macros near the boundary don't drift into each other.
-            with torch.no_grad():
-                free_pos[:, 0] = torch.max(
-                    torch.min(free_pos[:, 0], x_hi[hard_movable]),
-                    x_lo[hard_movable],
-                )
-                free_pos[:, 1] = torch.max(
-                    torch.min(free_pos[:, 1], y_hi[hard_movable]),
-                    y_lo[hard_movable],
-                )
-
-            if step % 1000 == 0 or step == self.num_steps - 1:
-                print(f"  step {step:5d}  overlap_loss={loss.item():.6e}")
-
-        # Write optimised positions back (no extra clamp — already enforced above).
-        with torch.no_grad():
-            placement[:num_hard][hard_movable] = free_pos
-
-        # Restore fixed macros to their original positions.
-        fixed_mask = benchmark.macro_fixed
-        placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
+        costs = compute_proxy_cost(placement, benchmark, plc)
+        print(f"\n  Final: proxy={costs['proxy_cost']:.6f}  "
+              f"wl={costs['wirelength_cost']:.6f}  "
+              f"den={costs['density_cost']:.6f}  "
+              f"cong={costs['congestion_cost']:.6f}  "
+              f"overlaps={costs['overlap_count']}")
 
         return placement
