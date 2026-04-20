@@ -211,7 +211,6 @@ Submission Run:
              ibm18    1.7899    2.7755    1.7722    +35.5%       -1.0%         0
      --------------------------------------------------------------------------------
                AVG    1.4427    2.1251    1.4578    +32.1%       +1.0%         0
-  ⎿  1 PostToolUse hook ran
 
                                                                                                                                                            05:42 PM claude-sonnet-4-6
 ⏺ AVG 1.4427 — beats the RePlAce baseline (1.4578) by +1.0% and SA by +32.1%, all 17 benchmarks valid with 0 overlaps.
