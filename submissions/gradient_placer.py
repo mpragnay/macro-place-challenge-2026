@@ -18,6 +18,8 @@ import torch
 from macro_place.benchmark import Benchmark
 from macro_place.objective import compute_proxy_cost
 
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # ── Overlap loss ─────────────────────────────────────────────────────────────
 
@@ -286,100 +288,108 @@ def _isolated_cell_density_loss(
 # ── Placer ────────────────────────────────────────────────────────────────────
 
 _LR_CANDIDATES = [0.001, 0.003, 0.005, 0.01, 0.02]
+_WD_CANDIDATES = [0.0, 0.01, 0.05, 0.1]
+_WR_CANDIDATES = [0.2, 0.5, 1.0, 2.0]
 _PILOT_STEPS   = 500
 
 
-def _pilot_lr_sweep_density(
-    free_pos_init, hard_base, movable_idx, hard_sizes, num_hard,
-    soft_pos, sizes, canvas_width, canvas_height, grid_rows, grid_cols,
-    x_lo, x_hi, y_lo, y_hi, lr_candidates, pilot_steps, verbose=True,
-):
-    """Density-based pilot fallback when plc is not available."""
-    best_lr, best_score = lr_candidates[0], float("inf")
-    for lr in lr_candidates:
-        free_pos = free_pos_init.clone().detach().requires_grad_(True)
-        opt = torch.optim.Adam([free_pos], lr=lr)
-        for _ in range(pilot_steps):
-            opt.zero_grad()
-            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
-            _overlap_loss(full_hard, hard_sizes, num_hard).backward()
-            opt.step()
-            with torch.no_grad():
-                free_pos[:, 0].clamp_(x_lo, x_hi)
-                free_pos[:, 1].clamp_(y_lo, y_hi)
-        with torch.no_grad():
-            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
-            full_pos  = torch.cat([full_hard, soft_pos], dim=0)
-            ol = _overlap_loss(full_hard, hard_sizes, num_hard).item()
-            dc = _density_cost(full_pos, sizes, canvas_width, canvas_height,
-                               grid_rows, grid_cols).item()
-            score = ol + dc
-        if verbose:
-            print(f"  pilot lr={lr}  overlap={ol:.4e}  density={dc:.6f}")
-        if score < best_score:
-            best_score, best_lr = score, lr
-    if verbose:
-        print(f"  → selected lr={best_lr}")
-    return best_lr
-
-
-def _pilot_lr_sweep(
+def _pilot_joint_sweep(
     free_pos_init: torch.Tensor,
     hard_base: torch.Tensor,
     movable_idx: torch.Tensor,
     hard_sizes: torch.Tensor,
     num_hard: int,
-    soft_pos: torch.Tensor,
+    soft_base: torch.Tensor,
+    soft_movable: torch.Tensor,
+    soft_movable_idx: torch.Tensor,
+    sizes: torch.Tensor,
     x_lo: torch.Tensor,
     x_hi: torch.Tensor,
     y_lo: torch.Tensor,
     y_hi: torch.Tensor,
+    sx_lo: torch.Tensor,
+    sx_hi: torch.Tensor,
+    sy_lo: torch.Tensor,
+    sy_hi: torch.Tensor,
     benchmark,
     plc,
     lr_candidates: list,
+    wd_candidates: list,
+    wr_candidates: list,
     pilot_steps: int,
+    w_overlap: float = 5.0,
     verbose: bool = True,
-) -> float:
+    dev: torch.device = None,
+) -> tuple:
+    if dev is None:
+        dev = _DEVICE
     """
-    Run a short pilot optimization for each candidate lr, evaluate full proxy
-    cost via the plc evaluator, and return the lr with the lowest proxy.
+    Joint sweep over (lr, w_density, w_reg) using the plc ground-truth evaluator.
+    Runs pilot_steps of full loss (overlap + bell density + L2 reg) for each of
+    the len(lr)*len(wd)*len(wr) configs and returns (lr, w_density, w_reg) with
+    lowest proxy cost.  When w_density==0, w_reg has no effect on hard macros
+    (soft macros just stay near init), so those configs collapse to overlap-only —
+    still swept for completeness.
     """
-    best_lr    = lr_candidates[0]
-    best_score = float("inf")
+    best_params = (lr_candidates[0], 0.0, wr_candidates[0])
+    best_score  = float("inf")
+    total = len(lr_candidates) * len(wd_candidates) * len(wr_candidates)
+    run   = 0
 
     for lr in lr_candidates:
-        free_pos = free_pos_init.clone().detach().requires_grad_(True)
-        opt = torch.optim.Adam([free_pos], lr=lr)
+        for wd in wd_candidates:
+            for wr in wr_candidates:
+                run += 1
+                free_pos  = free_pos_init.clone().detach().requires_grad_(True)
+                free_soft = soft_base[soft_movable].clone().detach().requires_grad_(True)
+                opt = torch.optim.Adam([free_pos, free_soft], lr=lr)
 
-        for _ in range(pilot_steps):
-            opt.zero_grad()
-            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
-            loss = _overlap_loss(full_hard, hard_sizes, num_hard)
-            loss.backward()
-            opt.step()
-            with torch.no_grad():
-                free_pos[:, 0] = free_pos[:, 0].clamp(min=x_lo, max=x_hi)
-                free_pos[:, 1] = free_pos[:, 1].clamp(min=y_lo, max=y_hi)
+                for _ in range(pilot_steps):
+                    opt.zero_grad()
+                    full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+                    full_soft = torch.index_put(soft_base, (soft_movable_idx,), free_soft)
+                    full_pos  = torch.cat([full_hard, full_soft], dim=0)
 
-        with torch.no_grad():
-            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
-            full_pos  = torch.cat([full_hard, soft_pos], dim=0)
-            # restore fixed macros before evaluating
-            full_pos[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed].float()
+                    ol   = _overlap_loss(full_hard, hard_sizes, num_hard)
+                    dl   = _bell_density_loss(
+                        full_pos, sizes,
+                        benchmark.canvas_width, benchmark.canvas_height,
+                        benchmark.grid_rows, benchmark.grid_cols,
+                    )
+                    rl   = ((free_soft - soft_base[soft_movable]) ** 2).mean()
+                    loss = w_overlap * ol + wd * dl + wr * rl
+                    loss.backward()
+                    opt.step()
 
-        costs = compute_proxy_cost(full_pos, benchmark, plc)
-        score = costs["proxy_cost"]
+                    with torch.no_grad():
+                        free_pos[:, 0].clamp_(x_lo, x_hi)
+                        free_pos[:, 1].clamp_(y_lo, y_hi)
+                        free_soft[:, 0].clamp_(sx_lo, sx_hi)
+                        free_soft[:, 1].clamp_(sy_lo, sy_hi)
 
-        if verbose:
-            print(f"  pilot lr={lr}  proxy={score:.6f}  overlaps={costs['overlap_count']}")
+                with torch.no_grad():
+                    full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+                    full_soft = torch.index_put(soft_base, (soft_movable_idx,), free_soft)
+                    full_pos  = torch.cat([full_hard, full_soft], dim=0)
+                    full_pos[benchmark.macro_fixed.to(dev)] = benchmark.macro_positions[benchmark.macro_fixed].float().to(dev)
 
-        if score < best_score:
-            best_score = score
-            best_lr    = lr
+                costs = compute_proxy_cost(full_pos.cpu(), benchmark, plc)
+                score = costs["proxy_cost"]
+
+                if verbose:
+                    print(
+                        f"  [{run:3d}/{total}] lr={lr}  wd={wd}  wr={wr}"
+                        f"  proxy={score:.6f}  overlaps={costs['overlap_count']}"
+                    )
+
+                if score < best_score:
+                    best_score  = score
+                    best_params = (lr, wd, wr)
 
     if verbose:
-        print(f"  → selected lr={best_lr}  (proxy={best_score:.6f})")
-    return best_lr
+        lr_, wd_, wr_ = best_params
+        print(f"  → selected lr={lr_}  w_density={wd_}  w_reg={wr_}  (proxy={best_score:.6f})")
+    return best_params
 
 
 class GradientPlacer:
@@ -422,9 +432,10 @@ class GradientPlacer:
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark, plc=None) -> torch.Tensor:
-        placement = benchmark.macro_positions.clone().float()
-        movable = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
-        sizes = benchmark.macro_sizes.float()
+        dev = _DEVICE
+        placement = benchmark.macro_positions.clone().float().to(dev)
+        movable = (benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()).to(dev)
+        sizes = benchmark.macro_sizes.float().to(dev)
 
         num_hard = benchmark.num_hard_macros
         hard_movable = movable[:num_hard]
@@ -434,7 +445,7 @@ class GradientPlacer:
         soft_base = placement[num_hard:].detach()
 
         # Soft movable macros (for density loss)
-        soft_movable = ~benchmark.macro_fixed[num_hard:]
+        soft_movable = (~benchmark.macro_fixed[num_hard:]).to(dev)
         soft_movable_idx = soft_movable.nonzero(as_tuple=True)[0]
         soft_sizes = sizes[num_hard:]
         soft_half_w = soft_sizes[:, 0] / 2.0
@@ -452,26 +463,28 @@ class GradientPlacer:
         y_lo = hard_half_h[hard_movable]
         y_hi = benchmark.canvas_height - hard_half_h[hard_movable]
 
-        # Auto-select lr via pilot sweep using full proxy (if plc available)
+        # Joint pilot sweep: select (lr, w_density, w_reg) via plc ground-truth evaluator
+        n_configs = len(_LR_CANDIDATES) * len(_WD_CANDIDATES) * len(_WR_CANDIDATES)
         if self.verbose:
-            print(f"  Running pilot lr sweep ({len(_LR_CANDIDATES)} candidates × {_PILOT_STEPS} steps)...")
+            print(f"  Running joint pilot sweep ({n_configs} configs × {_PILOT_STEPS} steps)...")
         if plc is not None:
-            lr = _pilot_lr_sweep(
+            lr, w_density, w_reg = _pilot_joint_sweep(
                 hard_base[hard_movable], hard_base, movable_idx,
-                hard_sizes, num_hard, soft_base,
+                hard_sizes, num_hard,
+                soft_base, soft_movable, soft_movable_idx, sizes,
                 x_lo, x_hi, y_lo, y_hi,
+                sx_lo, sx_hi, sy_lo, sy_hi,
                 benchmark, plc,
-                _LR_CANDIDATES, _PILOT_STEPS, self.verbose,
+                _LR_CANDIDATES, _WD_CANDIDATES, _WR_CANDIDATES,
+                _PILOT_STEPS, self.w_overlap, self.verbose, dev,
             )
         else:
-            lr = _pilot_lr_sweep_density(
-                hard_base[hard_movable], hard_base, movable_idx,
-                hard_sizes, num_hard, soft_base, sizes,
-                benchmark.canvas_width, benchmark.canvas_height,
-                benchmark.grid_rows, benchmark.grid_cols,
-                x_lo, x_hi, y_lo, y_hi,
-                _LR_CANDIDATES, _PILOT_STEPS, self.verbose,
-            )
+            # No plc: fall back to overlap-only with default weights
+            lr       = _LR_CANDIDATES[2]  # 0.005 safe default
+            w_density = self.w_density
+            w_reg     = self.w_reg
+            if self.verbose:
+                print(f"  No plc available — using defaults lr={lr}  w_density={w_density}  w_reg={w_reg}")
         num_steps = self.num_steps
 
         free_pos  = hard_base[hard_movable].clone().requires_grad_(True)
@@ -501,7 +514,7 @@ class GradientPlacer:
             )
             # L2 regularization pulls soft macros toward initial positions
             rl = ((free_soft - soft_base[soft_movable]) ** 2).mean()
-            loss = self.w_overlap * ol + self.w_density * dl + self.w_reg * rl
+            loss = self.w_overlap * ol + w_density * dl + w_reg * rl
             loss.backward()
             optimizer.step()
 
@@ -530,8 +543,8 @@ class GradientPlacer:
             placement[:num_hard][hard_movable] = free_pos
             placement[num_hard:][soft_movable] = free_soft
 
-        fixed_mask = benchmark.macro_fixed
-        placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
+        fixed_mask = benchmark.macro_fixed  # keep on CPU for indexing benchmark tensors
+        placement[fixed_mask.to(dev)] = benchmark.macro_positions[fixed_mask].float().to(dev)
 
         with torch.no_grad():
             d1 = _density_cost(placement, sizes,
@@ -539,4 +552,4 @@ class GradientPlacer:
                                benchmark.grid_rows, benchmark.grid_cols)
         print(f"  density_cost end  ={d1.item():.6f}  delta={d1.item()-d0.item():+.6f}")
 
-        return placement
+        return placement.cpu()
