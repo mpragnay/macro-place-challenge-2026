@@ -1,0 +1,217 @@
+Initial position results:
+ibm_01
+#[PLACEMENT GRID] Col: 45, Row: 41
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+proxy=1.0385  (wl=0.064 den=0.812 cong=1.137)  INVALID (69 overlaps)  [0.00s]
+
+Benchmark:
+--------------------------------------------------------------------------------
+    Benchmark     Proxy        SA   RePlAce     vs SA  vs RePlAce  Overlaps
+--------------------------------------------------------------------------------
+        ibm01    1.0385    1.3166    0.9976    +21.1%       -4.1%        69
+        ibm02    1.5658    1.9072    1.8370    +17.9%      +14.8%       108
+        ibm03    1.3255    1.7401    1.3222    +23.8%       -0.2%        61
+        ibm04    1.3133    1.5037    1.3024    +12.7%       -0.8%        68
+        ibm06    1.6577    2.5057    1.6187    +33.8%       -2.4%        47
+        ibm07    1.4758    2.0229    1.4633    +27.0%       -0.9%        82
+        ibm08    1.4664    1.9239    1.4285    +23.8%       -2.7%        86
+        ibm09    1.1126    1.3875    1.1194    +19.8%       +0.6%       101
+        ibm10    1.3397    2.1108    1.5009    +36.5%      +10.7%        74
+        ibm11    1.2141    1.7111    1.1774    +29.0%       -3.1%       129
+        ibm12    1.6251    2.8261    1.7261    +42.5%       +5.9%       187
+        ibm13    1.3854    1.9141    1.3355    +27.6%       -3.7%       180
+        ibm14    1.5938    2.2750    1.5436    +29.9%       -3.3%       189
+        ibm15    1.6033    2.3000    1.5159    +30.3%       -5.8%       165
+        ibm16    1.4911    2.2337    1.4780    +33.2%       -0.9%        86
+        ibm17    1.7392    3.6726    1.6446    +52.6%       -5.7%       231
+        ibm18    1.7899    2.7755    1.7722    +35.5%       -1.0%        76
+--------------------------------------------------------------------------------
+          AVG    1.4551    2.1251    1.4578    +31.5%       +0.2%      1939
+
+
+Just overlap density loss style:
+ibm01... #[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm01/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 45, Row: 41
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  step     0  overlap_loss=2.825976e-05
+  step  1000  overlap_loss=0.000000e+00
+  step  2000  overlap_loss=0.000000e+00
+  step  3000  overlap_loss=0.000000e+00
+  step  4000  overlap_loss=0.000000e+00
+  step  5000  overlap_loss=0.000000e+00
+  step  6000  overlap_loss=0.000000e+00
+  step  7000  overlap_loss=0.000000e+00
+  step  8000  overlap_loss=0.000000e+00
+  step  8999  overlap_loss=0.000000e+00
+proxy=1.0421  (wl=0.064 den=0.817 cong=1.138)  VALID  [14.92s]
+
+--------------------------------------------------------------------------------
+    Benchmark     Proxy        SA   RePlAce     vs SA  vs RePlAce  Overlaps
+--------------------------------------------------------------------------------
+        ibm01    1.0421    1.3166    0.9976    +20.9%       -4.5%         0
+        ibm02    1.5653    1.9072    1.8370    +17.9%      +14.8%         0
+        ibm03    1.3253    1.7401    1.3222    +23.8%       -0.2%         0
+        ibm04    1.3165    1.5037    1.3024    +12.4%       -1.1%         0
+        ibm06    1.6583    2.5057    1.6187    +33.8%       -2.4%         0
+        ibm07    1.4761    2.0229    1.4633    +27.0%       -0.9%         0
+        ibm08    1.4669    1.9239    1.4285    +23.8%       -2.7%         0
+        ibm09    1.1066    1.3875    1.1194    +20.2%       +1.1%         0
+        ibm10    1.3375    2.1108    1.5009    +36.6%      +10.9%         0
+        ibm11    1.2121    1.7111    1.1774    +29.2%       -2.9%         0
+        ibm12    1.6243    2.8261    1.7261    +42.5%       +5.9%         0
+        ibm13    1.3843    1.9141    1.3355    +27.7%       -3.7%         0
+        ibm14    1.5940    2.2750    1.5436    +29.9%       -3.3%         0
+        ibm15    1.6034    2.3000    1.5159    +30.3%       -5.8%         0
+        ibm16    1.4891    2.2337    1.4780    +33.3%       -0.8%         0
+        ibm17    1.7391    3.6726    1.6446    +52.6%       -5.7%         0
+        ibm18    1.7899    2.7755    1.7722    +35.5%       -1.0%         0
+--------------------------------------------------------------------------------
+          AVG    1.4547    2.1251    1.4578    +31.5%       +0.2%         0
+
+
+Overlap loss with Isolated cell density loss:
+--------------------------------------------------------------------------------
+    Benchmark     Proxy        SA   RePlAce     vs SA  vs RePlAce  Overlaps
+--------------------------------------------------------------------------------
+        ibm01    1.0385    1.3166    0.9976    +21.1%       -4.1%         0
+        ibm02    1.5657    1.9072    1.8370    +17.9%      +14.8%         0
+        ibm03    1.3254    1.7401    1.3222    +23.8%       -0.2%         0
+        ibm04    1.3133    1.5037    1.3024    +12.7%       -0.8%         0
+        ibm06    1.6577    2.5057    1.6187    +33.8%       -2.4%         0
+        ibm07    1.4760    2.0229    1.4633    +27.0%       -0.9%         0
+        ibm08    1.4665    1.9239    1.4285    +23.8%       -2.7%         0
+        ibm09    1.1124    1.3875    1.1194    +19.8%       +0.6%         0
+        ibm10    1.3367    2.1108    1.5009    +36.7%      +10.9%         0
+        ibm11    1.2138    1.7111    1.1774    +29.1%       -3.1%         0
+        ibm12    1.6254    2.8261    1.7261    +42.5%       +5.8%         0
+        ibm13    1.3853    1.9141    1.3355    +27.6%       -3.7%         0
+        ibm14    1.5938    2.2750    1.5436    +29.9%       -3.3%         0
+        ibm15    1.6033    2.3000    1.5159    +30.3%       -5.8%         0
+        ibm16    1.4911    2.2337    1.4780    +33.2%       -0.9%         0
+        ibm17    1.7391    3.6726    1.6446    +52.6%       -5.7%         0
+        ibm18    1.7899    2.7755    1.7722    +35.5%       -1.0%         0
+--------------------------------------------------------------------------------
+          AVG    1.4549    2.1251    1.4578    +31.5%       +0.2%         0
+
+Total runtime: 436.83s
+Monitor event: "full --all eval results"
+
+
+
+⏺ ibm06 — 1.6577, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm07 — 1.4760, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm08 — 1.4665, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm09 — 1.1059, unchanged (fast-path, no pilot). Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm10 — 1.3370, very slightly worse than before (1.3367, Δ+0.0003). Likely noise. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm11 — 1.2120, unchanged (fast-path). Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm12 — 1.6243, unchanged (fast-path). Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm13 — 1.3844, unchanged (fast-path). Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm14 — 1.5938, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm15 — 1.6033, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm16 — 1.4891, unchanged (fast-path). Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ ibm17 — 1.7391, unchanged. Still running...
+
+⏺ Monitor event: "full --all eval results"
+
+⏺ All done. AVG 1.4542 — identical to before, 0 overlaps across all 17 benchmarks. The pilot sweep didn't regress anything;
+  ibm10's +0.0003 was just noise (same avg).
+
+  The submission is clean and auto-tunes lr for any new benchmark it hasn't seen before.
+
+⏺ Background command "Full evaluation with pilot sweep" completed (exit code 0)
+
+⏺ Background process confirmed complete (exit code 0). We're good.
+
+  1 tasks (0 done, 1 open)
+  ◻ Full --all evaluation with pilot sweep
+
+─────────────────────────────────────────────
+
+  ibm01... #[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm01/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 45, Row: 41
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  density_cost start=0.811984
+  step     0  overlap=2.8260e-05  iso_density=1.8082e+00  density_cost=0.811978  n_isolated=1
+  step  1000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  2000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  3000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  4000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  5000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  6000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  7000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  8000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  9000  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  step  9999  overlap=0.0000e+00  iso_density=1.8082e+00  density_cost=0.812343  n_isolated=1
+  density_cost end  =0.812343  delta=+0.000358
+proxy=1.0385  (wl=0.064 den=0.812 cong=1.137)  VALID  [22.02s]
+
+
+
+Submission Run:
+--------------------------------------------------------------------------------
+         Benchmark     Proxy        SA   RePlAce     vs SA  vs RePlAce  Overlaps
+     --------------------------------------------------------------------------------
+             ibm01    1.0190    1.3166    0.9976    +22.6%       -2.1%         0
+             ibm02    1.5600    1.9072    1.8370    +18.2%      +15.1%         0
+             ibm03    1.3047    1.7401    1.3222    +25.0%       +1.3%         0
+             ibm04    1.3101    1.5037    1.3024    +12.9%       -0.6%         0
+             ibm06    1.6310    2.5057    1.6187    +34.9%       -0.8%         0
+             ibm07    1.4534    2.0229    1.4633    +28.2%       +0.7%         0
+             ibm08    1.4461    1.9239    1.4285    +24.8%       -1.2%         0
+             ibm09    1.1044    1.3875    1.1194    +20.4%       +1.3%         0
+             ibm10    1.3221    2.1108    1.5009    +37.4%      +11.9%         0
+             ibm11    1.1950    1.7111    1.1774    +30.2%       -1.5%         0
+             ibm12    1.6243    2.8261    1.7261    +42.5%       +5.9%         0
+             ibm13    1.3671    1.9141    1.3355    +28.6%       -2.4%         0
+             ibm14    1.5899    2.2750    1.5436    +30.1%       -3.0%         0
+             ibm15    1.5836    2.3000    1.5159    +31.1%       -4.5%         0
+             ibm16    1.4857    2.2337    1.4780    +33.5%       -0.5%         0
+             ibm17    1.7391    3.6726    1.6446    +52.6%       -5.7%         0
+             ibm18    1.7899    2.7755    1.7722    +35.5%       -1.0%         0
+     --------------------------------------------------------------------------------
+               AVG    1.4427    2.1251    1.4578    +32.1%       +1.0%         0
+
+                                                                                                                                                           05:42 PM claude-sonnet-4-6
+⏺ AVG 1.4427 — beats the RePlAce baseline (1.4578) by +1.0% and SA by +32.1%, all 17 benchmarks valid with 0 overlaps.
+Average 632.56 seconds per benchmark

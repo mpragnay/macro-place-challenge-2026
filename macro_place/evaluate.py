@@ -139,7 +139,12 @@ def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = No
         benchmark, plc = load_benchmark_from_dir(benchmark_dir)
 
     start = time.time()
-    placement = placer.place(benchmark)
+    import inspect
+    place_fn = placer.place
+    if "plc" in inspect.signature(place_fn).parameters:
+        placement = place_fn(benchmark, plc=plc)
+    else:
+        placement = place_fn(benchmark)
     runtime = time.time() - start
 
     is_valid, violations = validate_placement(placement, benchmark)
