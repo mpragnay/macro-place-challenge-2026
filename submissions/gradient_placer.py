@@ -555,8 +555,9 @@ class GradientPlacer:
                     fp[benchmark.macro_fixed.to(dev)] = benchmark.macro_positions[benchmark.macro_fixed].float().to(dev)
                 costs = compute_proxy_cost(fp.cpu(), benchmark, plc)
                 proxy_val = costs["proxy_cost"]
+                overlap_count = costs.get("overlap_count", 0)
 
-                if proxy_val < _best_proxy:
+                if overlap_count == 0 and proxy_val < _best_proxy:
                     _best_proxy = proxy_val
                     _best_free_pos  = free_pos.detach().clone()
                     _best_free_soft = free_soft.detach().clone()
