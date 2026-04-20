@@ -237,6 +237,330 @@ class RudyPrecompute:
         return loss
 
 
+# ── Gaussian RUDY Congestion Proxy ───────────────────────────────────────────
+
+class GaussianRudyPrecompute:
+    """
+    RUDY congestion proxy with per-macro Gaussian (bell) spreading.
+
+    Unlike hard-bbox RUDY where only bbox-boundary macros get gradient,
+    each macro spreads routing demand via a Gaussian kernel over grid cells.
+    Every macro gets a non-zero gradient, including those deep inside a net bbox.
+
+    Per-net demand at cell (r,c):
+        demand += (1/k) * sum_{i in net} [ gauss(cx - xi, σx) * gauss(cy - yi, σy) ]
+
+    where σ = sigma_scale × cell_size, giving ~1-cell spread by default.
+    """
+
+    def __init__(self, benchmark: Benchmark, movable_mask: torch.Tensor, *, sigma_scale: float = 1.0):
+        G = benchmark.grid_rows
+        C = benchmark.grid_cols
+        W = benchmark.canvas_width
+        H_canvas = benchmark.canvas_height
+        self.G = G
+        self.C = C
+        self.cell_w = W / C
+        self.cell_h = H_canvas / G
+        self.sigma_x = self.cell_w * sigma_scale
+        self.sigma_y = self.cell_h * sigma_scale
+
+        port_pos = benchmark.port_positions.float()
+        self.has_ports = port_pos.shape[0] > 0
+        self.port_positions = port_pos
+
+        movable_idx_set = set(movable_mask.nonzero(as_tuple=True)[0].tolist())
+
+        # Cell centers (used for Gaussian evaluation)
+        self.cell_cx = (torch.arange(C, dtype=torch.float32) + 0.5) * self.cell_w  # [C]
+        self.cell_cy = (torch.arange(G, dtype=torch.float32) + 0.5) * self.cell_h  # [G]
+
+        # Split fixed/variable nets
+        fixed_nets = []
+        variable_nets = []
+        var_pin_counts = []
+        for net_nodes in benchmark.net_nodes:
+            has_movable = any(n.item() in movable_idx_set for n in net_nodes)
+            if has_movable:
+                variable_nets.append(net_nodes)
+                var_pin_counts.append(len(net_nodes))
+            else:
+                fixed_nets.append(net_nodes)
+
+        # Pre-compute fixed map (one-time, no grad)
+        if self.has_ports:
+            fixed_all_pos = torch.cat([benchmark.macro_positions.float(), port_pos], dim=0)
+        else:
+            fixed_all_pos = benchmark.macro_positions.float()
+
+        self.fixed_map = self._build_gaussian_map(fixed_all_pos, fixed_nets)  # [G, C]
+
+        self.N_var = len(variable_nets)
+        if self.N_var > 0:
+            flat_indices, net_ids = [], []
+            for i, nodes in enumerate(variable_nets):
+                flat_indices.append(nodes)
+                net_ids.append(torch.full((len(nodes),), i, dtype=torch.long))
+            self.flat_node_indices = torch.cat(flat_indices)
+            self.net_ids_flat = torch.cat(net_ids)
+            self.pin_counts = torch.tensor(var_pin_counts, dtype=torch.float32)
+        else:
+            self.flat_node_indices = torch.zeros(0, dtype=torch.long)
+            self.net_ids_flat = torch.zeros(0, dtype=torch.long)
+            self.pin_counts = torch.zeros(0, dtype=torch.float32)
+
+    def _build_gaussian_map(self, all_pos: torch.Tensor, nets_list: list) -> torch.Tensor:
+        """Build Gaussian demand map for a list of nets (Python loop, used once for fixed nets)."""
+        G, C = self.G, self.C
+        demand = torch.zeros(G, C)
+        for net_nodes in nets_list:
+            node_pos = all_pos[net_nodes].float()  # [k, 2]
+            k = len(net_nodes)
+            dx = self.cell_cx[None, :] - node_pos[:, 0:1]   # [k, C]
+            dy = self.cell_cy[None, :] - node_pos[:, 1:2]   # [k, G]
+            bell_x = torch.exp(-dx ** 2 / (2 * self.sigma_x ** 2))  # [k, C]
+            bell_y = torch.exp(-dy ** 2 / (2 * self.sigma_y ** 2))  # [k, G]
+            # sum_i [bell_y_i ⊗ bell_x_i] = bell_y.T @ bell_x  [G, C]
+            demand = demand + bell_y.T @ bell_x / k
+        return demand
+
+    def compute(
+        self,
+        positions: torch.Tensor,
+        *,
+        temperature: float = 20.0,
+        top_frac: float = 0.05,
+        blocking_offset: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Differentiable Gaussian-RUDY congestion proxy (smooth abu top-frac%).
+
+        blocking_offset: optional [G, C] precomputed macro blocking map (no grad).
+            When provided, the smooth-max is taken over (net_routing + blocking),
+            matching the ground-truth congestion formula. High-blocking cells are
+            pre-penalized so gradients steer macros away from those cells.
+        """
+        device = positions.device
+        dtype = positions.dtype
+        G, C = self.G, self.C
+
+        demand = self.fixed_map.to(device=device, dtype=dtype)
+
+        if self.N_var > 0:
+            if self.has_ports:
+                port_pos = self.port_positions.to(device=device, dtype=dtype)
+                all_pos = torch.cat([positions, port_pos], dim=0)
+            else:
+                all_pos = positions
+
+            flat_idx = self.flat_node_indices.to(device)
+            net_ids  = self.net_ids_flat.to(device)
+            flat_pos = all_pos[flat_idx]  # [total_pins, 2]
+
+            cell_cx = self.cell_cx.to(device=device, dtype=dtype)
+            cell_cy = self.cell_cy.to(device=device, dtype=dtype)
+
+            dx = cell_cx[None, :] - flat_pos[:, 0:1]  # [total_pins, C]
+            dy = cell_cy[None, :] - flat_pos[:, 1:2]  # [total_pins, G]
+            bell_x = torch.exp(-dx ** 2 / (2 * self.sigma_x ** 2))  # [total_pins, C]
+            bell_y = torch.exp(-dy ** 2 / (2 * self.sigma_y ** 2))  # [total_pins, G]
+
+            # Per-pin footprint [total_pins, G, C] → flatten to [total_pins, G*C]
+            footprint = (bell_y[:, :, None] * bell_x[:, None, :]).reshape(-1, G * C)
+
+            # Scatter-sum per net: [N_var, G*C]
+            pin_counts = self.pin_counts.to(device=device, dtype=dtype)
+            per_net = torch.zeros(self.N_var, G * C, dtype=dtype, device=device)
+            per_net.scatter_add_(0, net_ids[:, None].expand(-1, G * C), footprint)
+            per_net = per_net / pin_counts[:, None]  # normalize by pin count per net
+
+            demand = demand + per_net.sum(dim=0).reshape(G, C)
+
+        # Add macro blocking offset (precomputed constant) so smooth-max selects
+        # cells hot in (net_routing + blocking) — matching ground-truth formula
+        if blocking_offset is not None:
+            combined = demand + blocking_offset.to(device=device, dtype=dtype)
+        else:
+            combined = demand
+
+        flat = combined.flatten()
+        k = max(1, int(flat.numel() * top_frac))
+        top_vals, _ = torch.topk(flat, k)
+        return torch.logsumexp(temperature * top_vals, dim=0) / temperature
+
+
+# ── Gaussian Hard Macro Blocking Loss ────────────────────────────────────────
+
+def _gaussian_hard_blocking_loss(
+    positions: torch.Tensor,
+    sizes: torch.Tensor,
+    num_hard: int,
+    canvas_w: float,
+    canvas_h: float,
+    grid_rows: int,
+    grid_cols: int,
+    *,
+    sigma_scale: float = 1.0,
+    top_frac: float = 0.05,
+    temperature: float = 20.0,
+) -> torch.Tensor:
+    """
+    Gaussian-smoothed hard macro blocking pressure map.
+
+    Each hard macro spreads its blocking contribution via a Gaussian kernel,
+    giving non-zero gradient everywhere (unlike the exact geometric version
+    which has zero gradient when a macro is fully inside a cell).
+
+    blocking_map[r, c] = sum_m [ (macro_area_m / cell_area)
+                                 × gauss(cx - x_m, σx)
+                                 × gauss(cy - y_m, σy) ]
+
+    Loss = smooth-max of top-frac cells (logsumexp).
+    """
+    G, C = grid_rows, grid_cols
+    device = positions.device
+    dtype  = positions.dtype
+
+    cell_w = canvas_w / C
+    cell_h = canvas_h / G
+    sigma_x = cell_w * sigma_scale
+    sigma_y = cell_h * sigma_scale
+    cell_area = cell_w * cell_h
+
+    cell_cx = ((torch.arange(C, device=device, dtype=dtype) + 0.5) * cell_w)  # [C]
+    cell_cy = ((torch.arange(G, device=device, dtype=dtype) + 0.5) * cell_h)  # [G]
+
+    hard_pos   = positions[:num_hard]                           # [N, 2]
+    hard_sizes = sizes[:num_hard].to(device=device, dtype=dtype)
+    macro_area = hard_sizes[:, 0] * hard_sizes[:, 1]           # [N]
+
+    dx = cell_cx[None, :] - hard_pos[:, 0:1]   # [N, C]
+    dy = cell_cy[None, :] - hard_pos[:, 1:2]   # [N, G]
+
+    bell_x = torch.exp(-dx ** 2 / (2 * sigma_x ** 2))  # [N, C]
+    bell_y = torch.exp(-dy ** 2 / (2 * sigma_y ** 2))  # [N, G]
+
+    # Scale each macro's footprint by its area relative to cell area
+    scaled_bell_x = bell_x * (macro_area[:, None] / cell_area)  # [N, C]
+
+    # block_map[r, c] = bell_y[:, r] · scaled_bell_x[:, c]  →  [G, C]
+    block_map = bell_y.T @ scaled_bell_x  # [G, C]
+
+    flat = block_map.flatten()
+    k = max(1, int(flat.numel() * top_frac))
+    top_vals, _ = torch.topk(flat, k)
+    return torch.logsumexp(temperature * top_vals, dim=0) / temperature
+
+
+# ── Hard Macro Blocking Loss ─────────────────────────────────────────────────
+
+def _hard_macro_blocking_map(
+    positions: torch.Tensor,
+    sizes: torch.Tensor,
+    num_hard: int,
+    canvas_w: float,
+    canvas_h: float,
+    grid_rows: int,
+    grid_cols: int,
+    hroutes_per_micron: float,
+    vroutes_per_micron: float,
+) -> torch.Tensor:
+    """
+    Differentiable hard-macro routing blocking map.
+
+    Per-cell blocking = sum_macros[ ol_x * ol_y ] * (1/(cell_h * grid_v_routes)
+                                                    + 1/(cell_w * grid_h_routes))
+
+    This mirrors the evaluator's V_macro_routing_cong / H_macro_routing_cong
+    computation. Using the product ol_x * ol_y makes it fully differentiable
+    and ensures macros only contribute to cells they actually overlap.
+
+    Returns:
+        [grid_rows, grid_cols] blocking map
+    """
+    G, C = grid_rows, grid_cols
+    device = positions.device
+    dtype = positions.dtype
+
+    cell_w = canvas_w / C
+    cell_h = canvas_h / G
+    grid_v_routes = cell_w * vroutes_per_micron
+    grid_h_routes = cell_h * hroutes_per_micron
+
+    cell_x_lo = torch.arange(C, dtype=dtype, device=device) * cell_w
+    cell_x_hi = cell_x_lo + cell_w
+    cell_y_lo = torch.arange(G, dtype=dtype, device=device) * cell_h
+    cell_y_hi = cell_y_lo + cell_h
+
+    hard_pos = positions[:num_hard]
+    hard_sz = sizes[:num_hard]
+    hw = hard_sz[:, 0] / 2.0
+    hh = hard_sz[:, 1] / 2.0
+    mx_lo = hard_pos[:, 0] - hw  # [N_hard]
+    mx_hi = hard_pos[:, 0] + hw
+    my_lo = hard_pos[:, 1] - hh
+    my_hi = hard_pos[:, 1] + hh
+
+    # ol_x: [C, N_hard]
+    ol_x = torch.clamp(
+        torch.minimum(cell_x_hi[:, None], mx_hi[None, :])
+        - torch.maximum(cell_x_lo[:, None], mx_lo[None, :]),
+        min=0.0,
+    )
+    # ol_y: [G, N_hard]
+    ol_y = torch.clamp(
+        torch.minimum(cell_y_hi[:, None], my_hi[None, :])
+        - torch.maximum(cell_y_lo[:, None], my_lo[None, :]),
+        min=0.0,
+    )
+
+    # overlap_area[r, c] = ol_y[r, :] @ ol_x[c, :].T  →  [G, C] via matmul
+    overlap_area = ol_y @ ol_x.T  # [G, C]
+
+    norm = 1.0 / (cell_h * grid_v_routes) + 1.0 / (cell_w * grid_h_routes)
+    return overlap_area * norm
+
+
+def _hard_macro_blocking_loss(
+    positions: torch.Tensor,
+    sizes: torch.Tensor,
+    num_hard: int,
+    canvas_w: float,
+    canvas_h: float,
+    grid_rows: int,
+    grid_cols: int,
+    hroutes_per_micron: float,
+    vroutes_per_micron: float,
+    top_frac: float = 0.05,
+    temperature: float = 20.0,
+    top_cells: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Smooth loss on top-5% hard-macro blocking cells.
+
+    If top_cells is provided (list of (r,c) pairs), only those cells contribute.
+    Otherwise all cells are used with soft-top-k via logsumexp.
+    """
+    bmap = _hard_macro_blocking_map(
+        positions, sizes, num_hard,
+        canvas_w, canvas_h, grid_rows, grid_cols,
+        hroutes_per_micron, vroutes_per_micron,
+    )  # [G, C]
+
+    if top_cells is not None:
+        # Only penalize the pre-identified hot cells
+        rows, cols = top_cells
+        cell_vals = bmap[rows, cols]
+        loss = torch.logsumexp(temperature * cell_vals, dim=0) / temperature
+    else:
+        flat = bmap.flatten()
+        k = max(1, int(flat.numel() * top_frac))
+        top_vals, _ = torch.topk(flat, k)
+        loss = torch.logsumexp(temperature * top_vals, dim=0) / temperature
+
+    return loss
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _find_and_load_plc(benchmark: Benchmark):
@@ -625,17 +949,28 @@ def _gradient_overlap_finetune(
     num_steps: int = 9000,
     cong_weight: float = 0.0,
     cong_temperature: float = 20.0,
+    blocking_weight: float = 0.0,
+    blocking_temperature: float = 20.0,
+    blocking_top_frac: float = 0.05,
+    gauss_blocking_weight: float = 0.0,
+    gauss_blocking_sigma: float = 1.0,
+    optimize_soft: bool = False,
+    soft_only_rudy: bool = False,
     log_interval: int = 500,
 ) -> torch.Tensor:
     """
-    Gradient descent on overlap loss (+ optional RUDY congestion) to resolve overlaps.
+    Gradient descent on overlap loss (+ optional Gaussian RUDY congestion).
 
     Args:
-        cong_weight:     Weight for RUDY congestion term (0 = disabled).
-        cong_temperature: logsumexp temperature for smooth abu(top-5%).
+        cong_weight:           Weight for Gaussian RUDY congestion term (0 = disabled).
+        optimize_soft:         If True, co-optimize soft macro positions via RUDY gradient.
+        blocking_weight:       Weight for exact geometric hard-macro blocking loss.
+        gauss_blocking_weight: Weight for Gaussian-smoothed hard-macro blocking loss.
+        gauss_blocking_sigma:  σ multiplier (in cell units) for Gaussian blocking spread.
     """
     num_hard = benchmark.num_hard_macros
 
+    # ── Hard macro setup ──────────────────────────────────────────────────
     hard_half_w = sizes[:num_hard, 0] / 2.0
     hard_half_h = sizes[:num_hard, 1] / 2.0
     x_lo = hard_half_w
@@ -644,61 +979,130 @@ def _gradient_overlap_finetune(
     y_hi = torch.full_like(hard_half_h, benchmark.canvas_height) - hard_half_h
 
     hard_movable = movable[:num_hard]
-    movable_idx = hard_movable.nonzero(as_tuple=True)[0]
-    hard_base = placement[:num_hard].detach()
-    hard_sizes = sizes[:num_hard]
+    movable_idx  = hard_movable.nonzero(as_tuple=True)[0]
+    hard_base    = placement[:num_hard].detach()
+    hard_sizes   = sizes[:num_hard]
+    free_pos     = hard_base[hard_movable].clone().requires_grad_(True)
 
-    free_pos = hard_base[hard_movable].clone().requires_grad_(True)
-    optimizer = torch.optim.Adam([free_pos], lr=lr)
+    # ── Soft macro setup (optional) ───────────────────────────────────────
+    soft_base = placement[num_hard:].detach()
+    free_pos_soft = None
+    soft_movable_idx = None
+    soft_x_lo = soft_x_hi = soft_y_lo = soft_y_hi = None
 
-    # Pre-compute RUDY fixed contribution once (if congestion term enabled)
+    if optimize_soft and benchmark.num_soft_macros > 0:
+        soft_movable_mask = ~benchmark.macro_fixed[num_hard:]
+        soft_movable_idx  = soft_movable_mask.nonzero(as_tuple=True)[0]
+        if len(soft_movable_idx) > 0:
+            soft_half_w = sizes[num_hard:][soft_movable_mask, 0] / 2.0
+            soft_half_h = sizes[num_hard:][soft_movable_mask, 1] / 2.0
+            soft_x_lo = soft_half_w
+            soft_x_hi = torch.full_like(soft_half_w, benchmark.canvas_width) - soft_half_w
+            soft_y_lo = soft_half_h
+            soft_y_hi = torch.full_like(soft_half_h, benchmark.canvas_height) - soft_half_h
+            free_pos_soft = soft_base[soft_movable_mask].clone().requires_grad_(True)
+
+    opt_params = [free_pos] + ([free_pos_soft] if free_pos_soft is not None else [])
+    optimizer  = torch.optim.Adam(opt_params, lr=lr)
+
+    # ── RUDY pre-compute ──────────────────────────────────────────────────
     rudy = None
     if cong_weight > 0.0:
-        print(f"  Pre-computing RUDY fixed contributions...")
-        rudy = RudyPrecompute(benchmark, movable)
+        # Expand movable mask to include soft macros so their nets become variable
+        broad_movable = benchmark.get_movable_mask() if optimize_soft else movable
+        print(f"  Pre-computing Gaussian RUDY (optimize_soft={optimize_soft})...")
+        rudy = GaussianRudyPrecompute(benchmark, broad_movable, sigma_scale=1.0)
         print(f"  Variable nets: {rudy.N_var} / {benchmark.num_nets}")
 
-    print(f"\n  ── Overlap Fine-tuning Phase ({num_steps} steps, "
-          f"cong_weight={cong_weight}) ──")
+    hot_blocking_cells = None
+    blocking_refresh_interval = max(1, num_steps // 5)
 
-    # Full macro positions tensor (hard + soft) needed for RUDY
-    soft_base = placement[num_hard:].detach()
+    print(f"\n  ── Overlap Fine-tuning Phase ({num_steps} steps, "
+          f"cong_weight={cong_weight}, optimize_soft={optimize_soft}) ──")
 
     for step in range(num_steps):
         optimizer.zero_grad()
+
+        # Reconstruct full hard position tensor
         full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)
+
+        # Reconstruct full soft position tensor
+        if free_pos_soft is not None:
+            full_soft_pos = torch.index_put(soft_base, (soft_movable_idx,), free_pos_soft)
+        else:
+            full_soft_pos = soft_base
+
+        full_pos = torch.cat([full_hard_pos, full_soft_pos], dim=0)
+
         overlap_loss = _overlap_loss(full_hard_pos, hard_sizes, num_hard)
+        cong_loss        = torch.tensor(0.0)
+        block_loss       = torch.tensor(0.0)
+        gauss_block_loss = torch.tensor(0.0)
 
         if rudy is not None:
-            # Build full positions [num_macros, 2] for RUDY
-            full_pos = torch.cat([full_hard_pos, soft_base], dim=0)
-            cong_loss = rudy.compute(
-                full_pos,
-                temperature=cong_temperature,
-                top_frac=0.05,
-            )
-            loss = overlap_loss + cong_weight * cong_loss
-        else:
-            loss = overlap_loss
-            cong_loss = torch.tensor(0.0)
+            # soft_only_rudy: detach hard positions so RUDY gradient flows only to soft macros
+            rudy_pos = torch.cat([full_hard_pos.detach(), full_soft_pos], dim=0) \
+                       if soft_only_rudy else full_pos
+            cong_loss = rudy.compute(rudy_pos, temperature=cong_temperature, top_frac=0.05)
 
+        if blocking_weight > 0.0:
+            if step % blocking_refresh_interval == 0:
+                with torch.no_grad():
+                    bmap = _hard_macro_blocking_map(
+                        full_hard_pos.detach(), hard_sizes, num_hard,
+                        benchmark.canvas_width, benchmark.canvas_height,
+                        benchmark.grid_rows, benchmark.grid_cols,
+                        benchmark.hroutes_per_micron, benchmark.vroutes_per_micron,
+                    )
+                    flat = bmap.flatten()
+                    k = max(1, int(flat.numel() * blocking_top_frac))
+                    _, top_idx = torch.topk(flat, k)
+                    rows = top_idx // benchmark.grid_cols
+                    cols = top_idx % benchmark.grid_cols
+                    hot_blocking_cells = (rows, cols)
+
+            block_loss = _hard_macro_blocking_loss(
+                full_hard_pos, hard_sizes, num_hard,
+                benchmark.canvas_width, benchmark.canvas_height,
+                benchmark.grid_rows, benchmark.grid_cols,
+                benchmark.hroutes_per_micron, benchmark.vroutes_per_micron,
+                temperature=blocking_temperature,
+                top_cells=hot_blocking_cells,
+            )
+
+        if gauss_blocking_weight > 0.0:
+            gauss_block_loss = _gaussian_hard_blocking_loss(
+                full_hard_pos, hard_sizes, num_hard,
+                benchmark.canvas_width, benchmark.canvas_height,
+                benchmark.grid_rows, benchmark.grid_cols,
+                sigma_scale=gauss_blocking_sigma,
+                top_frac=0.05,
+                temperature=20.0,
+            )
+
+        loss = (overlap_loss
+                + cong_weight * cong_loss
+                + blocking_weight * block_loss
+                + gauss_blocking_weight * gauss_block_loss)
         loss.backward()
         optimizer.step()
 
         with torch.no_grad():
-            free_pos[:, 0] = torch.max(
-                torch.min(free_pos[:, 0], x_hi[hard_movable]),
-                x_lo[hard_movable])
-            free_pos[:, 1] = torch.max(
-                torch.min(free_pos[:, 1], y_hi[hard_movable]),
-                y_lo[hard_movable])
+            free_pos[:, 0].clamp_(x_lo[hard_movable], x_hi[hard_movable])
+            free_pos[:, 1].clamp_(y_lo[hard_movable], y_hi[hard_movable])
+            if free_pos_soft is not None:
+                free_pos_soft[:, 0].clamp_(soft_x_lo, soft_x_hi)
+                free_pos_soft[:, 1].clamp_(soft_y_lo, soft_y_hi)
 
         if step % log_interval == 0 or step == num_steps - 1:
             print(f"  step {step:5d}  overlap={overlap_loss.item():.4e}  "
-                  f"rudy={cong_loss.item():.4f}")
+                  f"rudy={cong_loss.item():.4f}  "
+                  f"gblk={gauss_block_loss.item():.4f}")
 
     with torch.no_grad():
         placement[:num_hard][hard_movable] = free_pos
+        if free_pos_soft is not None:
+            placement[num_hard:][soft_movable_idx] = free_pos_soft
 
     fixed_mask = benchmark.macro_fixed
     placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
@@ -723,6 +1127,10 @@ class GradientPlacer:
         lr: float = 0.01,
         cong_weight: float = 0.0,
         cong_temperature: float = 20.0,
+        blocking_weight: float = 0.0,
+        blocking_temperature: float = 20.0,
+        blocking_top_frac: float = 0.05,
+        optimize_soft: bool = False,
         greedy_rounds: int = 20,
         greedy_trials: int = 10,
         greedy_top_k_macros: int = 10,
@@ -734,6 +1142,10 @@ class GradientPlacer:
         self.lr = lr
         self.cong_weight = cong_weight
         self.cong_temperature = cong_temperature
+        self.blocking_weight = blocking_weight
+        self.blocking_temperature = blocking_temperature
+        self.blocking_top_frac = blocking_top_frac
+        self.optimize_soft = optimize_soft
         self.greedy_rounds = greedy_rounds
         self.greedy_trials = greedy_trials
         self.greedy_top_k_macros = greedy_top_k_macros
@@ -752,6 +1164,10 @@ class GradientPlacer:
             lr=self.lr, num_steps=self.overlap_steps,
             cong_weight=self.cong_weight,
             cong_temperature=self.cong_temperature,
+            blocking_weight=self.blocking_weight,
+            blocking_temperature=self.blocking_temperature,
+            blocking_top_frac=self.blocking_top_frac,
+            optimize_soft=self.optimize_soft,
         )
 
         plc = _find_and_load_plc(benchmark)
