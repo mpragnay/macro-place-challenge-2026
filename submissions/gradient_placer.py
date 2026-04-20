@@ -16,6 +16,7 @@ import math
 
 import torch
 from macro_place.benchmark import Benchmark
+from macro_place.objective import compute_proxy_cost
 
 
 # ── Overlap loss ─────────────────────────────────────────────────────────────
@@ -138,29 +139,77 @@ def _per_cell(
     return (ov_y.unsqueeze(2) * ov_x.unsqueeze(1)).sum(dim=0) / cell_area  # [R, C]
 
 
+# ── Bell potential density loss ───────────────────────────────────────────────
+
+def _bell_density_loss(
+    positions: torch.Tensor,
+    sizes: torch.Tensor,
+    canvas_width: float,
+    canvas_height: float,
+    grid_rows: int,
+    grid_cols: int,
+    top_frac: float = 0.1,
+    sigma_scale: float = 1.0,
+) -> torch.Tensor:
+    """
+    Gaussian bell potential density loss (ePlace/RePlAce-style).
+
+    Each macro contributes to every bin via a Gaussian kernel so the gradient
+    is non-zero everywhere — including macros fully contained in one cell.
+
+    σ_x = sigma_scale * (half_macro_w + half_cell_w)
+    σ_y = sigma_scale * (half_macro_h + half_cell_h)
+
+    density[r,c] = Σ_i exp(-dx²/2σx²) * exp(-dy²/2σy²)
+    loss = 0.5 * mean(top top_frac bins)   [matches the actual density cost formula]
+    """
+    cell_w = canvas_width  / grid_cols
+    cell_h = canvas_height / grid_rows
+
+    col_cx = (torch.arange(grid_cols, dtype=positions.dtype, device=positions.device) + 0.5) * cell_w
+    row_cy = (torch.arange(grid_rows, dtype=positions.dtype, device=positions.device) + 0.5) * cell_h
+
+    xi = positions[:, 0:1]          # [N, 1]
+    yi = positions[:, 1:2]          # [N, 1]
+    sigma_x = sigma_scale * (sizes[:, 0:1] / 2.0 + cell_w / 2.0)  # [N, 1]
+    sigma_y = sigma_scale * (sizes[:, 1:2] / 2.0 + cell_h / 2.0)  # [N, 1]
+
+    phi_x = torch.exp(-(xi - col_cx.unsqueeze(0)) ** 2 / (2.0 * sigma_x ** 2))  # [N, C]
+    phi_y = torch.exp(-(yi - row_cy.unsqueeze(0)) ** 2 / (2.0 * sigma_y ** 2))  # [N, R]
+
+    density = (phi_y.unsqueeze(2) * phi_x.unsqueeze(1)).sum(dim=0)  # [R, C]
+
+    flat = density.reshape(-1)
+    k = max(1, int(flat.numel() * top_frac))
+    top_vals, _ = torch.topk(flat, k)
+    return 0.5 * top_vals.mean()
+
+
 # ── Isolated dense cell detection ────────────────────────────────────────────
 
 def _find_isolated_dense_cells(
     per_cell_density: torch.Tensor,
     num_dense: int,
     neighbor_ratio: float,
+    min_sparse_neighbors: int = 5,
 ) -> list:
     """
-    Find up to `num_dense` densest grid cells where every 8-connected
-    neighbour has density <= neighbor_ratio * cell_density.
+    Find up to `num_dense` densest grid cells where at least
+    `min_sparse_neighbors` of the 8-connected neighbours have density
+    <= neighbor_ratio * cell_density (partial isolation criterion).
 
     Args:
-        per_cell_density: [R, C] density tensor (detached)
-        num_dense:        max isolated cells to return
-        neighbor_ratio:   neighbour must be <= this fraction of cell density
+        per_cell_density:    [R, C] density tensor (detached)
+        num_dense:           max isolated cells to return
+        neighbor_ratio:      neighbour is sparse if <= this fraction of cell density
+        min_sparse_neighbors: minimum number of sparse neighbours required (default 5, i.e. >4/8)
 
     Returns:
         List of (r, c) tuples sorted by density descending.
     """
     R, C = per_cell_density.shape
     flat = per_cell_density.reshape(-1)
-    n_candidates = min(R * C, num_dense * 20)
-    _, top_idx = torch.topk(flat, n_candidates)
+    _, top_idx = torch.topk(flat, R * C)
 
     isolated = []
     for idx in top_idx.tolist():
@@ -169,13 +218,11 @@ def _find_isolated_dense_cells(
         if d == 0.0:
             break
 
-        max_nbr = max(
-            (per_cell_density[r + dr, c + dc].item()
-             for dr in (-1, 0, 1) for dc in (-1, 0, 1)
-             if (dr != 0 or dc != 0) and 0 <= r + dr < R and 0 <= c + dc < C),
-            default=0.0,
-        )
-        if max_nbr <= neighbor_ratio * d:
+        nbrs = [per_cell_density[r + dr, c + dc].item()
+                for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                if (dr != 0 or dc != 0) and 0 <= r + dr < R and 0 <= c + dc < C]
+        sparse_count = sum(1 for n in nbrs if n <= neighbor_ratio * d)
+        if sparse_count >= min_sparse_neighbors:
             isolated.append((r, c))
             if len(isolated) >= num_dense:
                 break
@@ -238,6 +285,103 @@ def _isolated_cell_density_loss(
 
 # ── Placer ────────────────────────────────────────────────────────────────────
 
+_LR_CANDIDATES = [0.001, 0.003, 0.005, 0.01, 0.02]
+_PILOT_STEPS   = 500
+
+
+def _pilot_lr_sweep_density(
+    free_pos_init, hard_base, movable_idx, hard_sizes, num_hard,
+    soft_pos, sizes, canvas_width, canvas_height, grid_rows, grid_cols,
+    x_lo, x_hi, y_lo, y_hi, lr_candidates, pilot_steps, verbose=True,
+):
+    """Density-based pilot fallback when plc is not available."""
+    best_lr, best_score = lr_candidates[0], float("inf")
+    for lr in lr_candidates:
+        free_pos = free_pos_init.clone().detach().requires_grad_(True)
+        opt = torch.optim.Adam([free_pos], lr=lr)
+        for _ in range(pilot_steps):
+            opt.zero_grad()
+            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+            _overlap_loss(full_hard, hard_sizes, num_hard).backward()
+            opt.step()
+            with torch.no_grad():
+                free_pos[:, 0].clamp_(x_lo, x_hi)
+                free_pos[:, 1].clamp_(y_lo, y_hi)
+        with torch.no_grad():
+            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+            full_pos  = torch.cat([full_hard, soft_pos], dim=0)
+            ol = _overlap_loss(full_hard, hard_sizes, num_hard).item()
+            dc = _density_cost(full_pos, sizes, canvas_width, canvas_height,
+                               grid_rows, grid_cols).item()
+            score = ol + dc
+        if verbose:
+            print(f"  pilot lr={lr}  overlap={ol:.4e}  density={dc:.6f}")
+        if score < best_score:
+            best_score, best_lr = score, lr
+    if verbose:
+        print(f"  → selected lr={best_lr}")
+    return best_lr
+
+
+def _pilot_lr_sweep(
+    free_pos_init: torch.Tensor,
+    hard_base: torch.Tensor,
+    movable_idx: torch.Tensor,
+    hard_sizes: torch.Tensor,
+    num_hard: int,
+    soft_pos: torch.Tensor,
+    x_lo: torch.Tensor,
+    x_hi: torch.Tensor,
+    y_lo: torch.Tensor,
+    y_hi: torch.Tensor,
+    benchmark,
+    plc,
+    lr_candidates: list,
+    pilot_steps: int,
+    verbose: bool = True,
+) -> float:
+    """
+    Run a short pilot optimization for each candidate lr, evaluate full proxy
+    cost via the plc evaluator, and return the lr with the lowest proxy.
+    """
+    best_lr    = lr_candidates[0]
+    best_score = float("inf")
+
+    for lr in lr_candidates:
+        free_pos = free_pos_init.clone().detach().requires_grad_(True)
+        opt = torch.optim.Adam([free_pos], lr=lr)
+
+        for _ in range(pilot_steps):
+            opt.zero_grad()
+            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+            loss = _overlap_loss(full_hard, hard_sizes, num_hard)
+            loss.backward()
+            opt.step()
+            with torch.no_grad():
+                free_pos[:, 0] = free_pos[:, 0].clamp(min=x_lo, max=x_hi)
+                free_pos[:, 1] = free_pos[:, 1].clamp(min=y_lo, max=y_hi)
+
+        with torch.no_grad():
+            full_hard = torch.index_put(hard_base, (movable_idx,), free_pos)
+            full_pos  = torch.cat([full_hard, soft_pos], dim=0)
+            # restore fixed macros before evaluating
+            full_pos[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed].float()
+
+        costs = compute_proxy_cost(full_pos, benchmark, plc)
+        score = costs["proxy_cost"]
+
+        if verbose:
+            print(f"  pilot lr={lr}  proxy={score:.6f}  overlaps={costs['overlap_count']}")
+
+        if score < best_score:
+            best_score = score
+            best_lr    = lr
+
+    if verbose:
+        print(f"  → selected lr={best_lr}  (proxy={best_score:.6f})")
+    return best_lr
+
+
 class GradientPlacer:
     """
     Gradient-based macro placer.
@@ -258,8 +402,9 @@ class GradientPlacer:
         lr: float = 0.001,
         num_steps: int = 10000,
         w_overlap: float = 5.0,
-        w_density: float = 0.0,
-        num_dense: int = 3,
+        w_density: float = 0.1,
+        w_reg: float = 0.5,
+        num_dense: int = 20,
         neighbor_ratio: float = 0.3,
         refresh_every: int = 200,
         log_every: int = 1000,
@@ -269,13 +414,14 @@ class GradientPlacer:
         self.num_steps = num_steps
         self.w_overlap = w_overlap
         self.w_density = w_density
+        self.w_reg = w_reg
         self.num_dense = num_dense
         self.neighbor_ratio = neighbor_ratio
         self.refresh_every = refresh_every
         self.log_every = log_every
         self.verbose = verbose
 
-    def place(self, benchmark: Benchmark) -> torch.Tensor:
+    def place(self, benchmark: Benchmark, plc=None) -> torch.Tensor:
         placement = benchmark.macro_positions.clone().float()
         movable = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
         sizes = benchmark.macro_sizes.float()
@@ -285,9 +431,20 @@ class GradientPlacer:
         movable_idx = hard_movable.nonzero(as_tuple=True)[0]
         hard_base = placement[:num_hard].detach()
         hard_sizes = sizes[:num_hard]
-        soft_pos = placement[num_hard:].detach()   # [S, 2] — fixed throughout
+        soft_base = placement[num_hard:].detach()
 
-        # Canvas clamp bounds
+        # Soft movable macros (for density loss)
+        soft_movable = ~benchmark.macro_fixed[num_hard:]
+        soft_movable_idx = soft_movable.nonzero(as_tuple=True)[0]
+        soft_sizes = sizes[num_hard:]
+        soft_half_w = soft_sizes[:, 0] / 2.0
+        soft_half_h = soft_sizes[:, 1] / 2.0
+        sx_lo = soft_half_w[soft_movable]
+        sx_hi = benchmark.canvas_width  - soft_half_w[soft_movable]
+        sy_lo = soft_half_h[soft_movable]
+        sy_hi = benchmark.canvas_height - soft_half_h[soft_movable]
+
+        # Canvas clamp bounds for hard macros
         hard_half_w = hard_sizes[:, 0] / 2.0
         hard_half_h = hard_sizes[:, 1] / 2.0
         x_lo = hard_half_w[hard_movable]
@@ -295,76 +452,83 @@ class GradientPlacer:
         y_lo = hard_half_h[hard_movable]
         y_hi = benchmark.canvas_height - hard_half_h[hard_movable]
 
-        free_pos = hard_base[hard_movable].clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([free_pos], lr=self.lr)
+        # Auto-select lr via pilot sweep using full proxy (if plc available)
+        if self.verbose:
+            print(f"  Running pilot lr sweep ({len(_LR_CANDIDATES)} candidates × {_PILOT_STEPS} steps)...")
+        if plc is not None:
+            lr = _pilot_lr_sweep(
+                hard_base[hard_movable], hard_base, movable_idx,
+                hard_sizes, num_hard, soft_base,
+                x_lo, x_hi, y_lo, y_hi,
+                benchmark, plc,
+                _LR_CANDIDATES, _PILOT_STEPS, self.verbose,
+            )
+        else:
+            lr = _pilot_lr_sweep_density(
+                hard_base[hard_movable], hard_base, movable_idx,
+                hard_sizes, num_hard, soft_base, sizes,
+                benchmark.canvas_width, benchmark.canvas_height,
+                benchmark.grid_rows, benchmark.grid_cols,
+                x_lo, x_hi, y_lo, y_hi,
+                _LR_CANDIDATES, _PILOT_STEPS, self.verbose,
+            )
+        num_steps = self.num_steps
+
+        free_pos  = hard_base[hard_movable].clone().requires_grad_(True)
+        free_soft = soft_base[soft_movable].clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([free_pos, free_soft], lr=lr)
 
         # Initial density cost
         with torch.no_grad():
-            init_full = torch.cat([hard_base, soft_pos], dim=0)
+            init_full = torch.cat([hard_base, soft_base], dim=0)
             d0 = _density_cost(init_full, sizes,
                                benchmark.canvas_width, benchmark.canvas_height,
                                benchmark.grid_rows, benchmark.grid_cols)
         print(f"  density_cost start={d0.item():.6f}")
 
-        isolated_cells = []
-        last_refresh = -self.refresh_every  # trigger on step 0
-
-        for step in range(self.num_steps):
+        for step in range(num_steps):
             optimizer.zero_grad()
 
-            full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)  # [H, 2]
-            full_pos = torch.cat([full_hard_pos, soft_pos], dim=0)                # [N, 2]
-
-            # Refresh isolated cell list
-            if step - last_refresh >= self.refresh_every:
-                with torch.no_grad():
-                    pc = _per_cell(
-                        full_pos.detach(), sizes,
-                        benchmark.canvas_width, benchmark.canvas_height,
-                        benchmark.grid_rows, benchmark.grid_cols,
-                    )
-                    isolated_cells = _find_isolated_dense_cells(
-                        pc, self.num_dense, self.neighbor_ratio
-                    )
-                last_refresh = step
+            full_hard_pos = torch.index_put(hard_base, (movable_idx,), free_pos)
+            full_soft_pos = torch.index_put(soft_base, (soft_movable_idx,), free_soft)
+            full_pos = torch.cat([full_hard_pos, full_soft_pos], dim=0)
 
             ol = _overlap_loss(full_hard_pos, hard_sizes, num_hard)
-            dl = _isolated_cell_density_loss(
+            dl = _bell_density_loss(
                 full_pos, sizes,
                 benchmark.canvas_width, benchmark.canvas_height,
                 benchmark.grid_rows, benchmark.grid_cols,
-                isolated_cells,
             )
-            loss = self.w_overlap * ol + self.w_density * dl
+            # L2 regularization pulls soft macros toward initial positions
+            rl = ((free_soft - soft_base[soft_movable]) ** 2).mean()
+            loss = self.w_overlap * ol + self.w_density * dl + self.w_reg * rl
             loss.backward()
             optimizer.step()
 
             with torch.no_grad():
-                free_pos[:, 0] = free_pos[:, 0].clamp(min=x_lo, max=x_hi)
-                free_pos[:, 1] = free_pos[:, 1].clamp(min=y_lo, max=y_hi)
+                free_pos[:, 0].clamp_(x_lo, x_hi)
+                free_pos[:, 1].clamp_(y_lo, y_hi)
+                free_soft[:, 0].clamp_(sx_lo, sx_hi)
+                free_soft[:, 1].clamp_(sy_lo, sy_hi)
 
-            if self.verbose and (step % self.log_every == 0 or step == self.num_steps - 1):
+            if self.verbose and (step % self.log_every == 0 or step == num_steps - 1):
                 with torch.no_grad():
-                    dc = _density_cost(
-                        torch.cat([
-                            torch.index_put(hard_base, (movable_idx,), free_pos),
-                            soft_pos,
-                        ], dim=0),
-                        sizes,
-                        benchmark.canvas_width, benchmark.canvas_height,
-                        benchmark.grid_rows, benchmark.grid_cols,
-                    )
+                    fh = torch.index_put(hard_base, (movable_idx,), free_pos)
+                    fs = torch.index_put(soft_base, (soft_movable_idx,), free_soft)
+                    dc = _density_cost(torch.cat([fh, fs], dim=0), sizes,
+                                       benchmark.canvas_width, benchmark.canvas_height,
+                                       benchmark.grid_rows, benchmark.grid_cols)
                 print(
                     f"  step {step:5d}"
                     f"  overlap={ol.item():.4e}"
-                    f"  iso_density={dl.item():.4e}"
+                    f"  bell_density={dl.item():.4e}"
                     f"  density_cost={dc.item():.6f}"
-                    f"  n_isolated={len(isolated_cells)}"
                 )
 
         # Write back
         with torch.no_grad():
             placement[:num_hard][hard_movable] = free_pos
+            placement[num_hard:][soft_movable] = free_soft
 
         fixed_mask = benchmark.macro_fixed
         placement[fixed_mask] = benchmark.macro_positions[fixed_mask]
