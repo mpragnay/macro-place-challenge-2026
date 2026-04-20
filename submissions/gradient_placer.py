@@ -287,8 +287,8 @@ def _isolated_cell_density_loss(
 
 # ── Placer ────────────────────────────────────────────────────────────────────
 
-_LR_CANDIDATES = [0.001, 0.003, 0.005, 0.01, 0.02]
-_WD_CANDIDATES = [0.0, 0.01, 0.05, 0.1]
+_LR_CANDIDATES = [0.001, 0.003, 0.005, 0.01]
+_WD_CANDIDATES = [0.01, 0.05, 0.1]
 _WR_CANDIDATES = [0.2, 0.5, 1.0, 2.0]
 _PILOT_STEPS   = 500
 
@@ -499,6 +499,14 @@ class GradientPlacer:
                                benchmark.grid_rows, benchmark.grid_cols)
         print(f"  density_cost start={d0.item():.6f}")
 
+        _ES_CHECK = 500   # evaluate proxy every N steps
+        _ES_WINDOW = 1000  # look back this many steps for proxy change
+        _ES_TOL = 1e-3    # stop if proxy improved < 0.1% over window
+        _proxy_history: list[float] = []
+        _best_proxy = float("inf")
+        _best_free_pos = free_pos.detach().clone()
+        _best_free_soft = free_soft.detach().clone()
+
         for step in range(num_steps):
             optimizer.zero_grad()
 
@@ -537,6 +545,39 @@ class GradientPlacer:
                     f"  bell_density={dl.item():.4e}"
                     f"  density_cost={dc.item():.6f}"
                 )
+
+            # Checkpoint + early stopping every _ES_CHECK steps (only when valid)
+            if step % _ES_CHECK == 0 and step > 0 and ol.item() == 0.0:
+                with torch.no_grad():
+                    fh = torch.index_put(hard_base, (movable_idx,), free_pos)
+                    fs = torch.index_put(soft_base, (soft_movable_idx,), free_soft)
+                    fp = torch.cat([fh, fs], dim=0)
+                    fp[benchmark.macro_fixed.to(dev)] = benchmark.macro_positions[benchmark.macro_fixed].float().to(dev)
+                costs = compute_proxy_cost(fp.cpu(), benchmark, plc)
+                proxy_val = costs["proxy_cost"]
+
+                if proxy_val < _best_proxy:
+                    _best_proxy = proxy_val
+                    _best_free_pos  = free_pos.detach().clone()
+                    _best_free_soft = free_soft.detach().clone()
+                    if self.verbose:
+                        print(f"  checkpoint step {step}  proxy={proxy_val:.6f}")
+
+                _proxy_history.append(proxy_val)
+                window_steps = _ES_WINDOW // _ES_CHECK
+                if len(_proxy_history) >= window_steps:
+                    past = _proxy_history[-window_steps]
+                    if past - proxy_val < _ES_TOL * past:
+                        if self.verbose:
+                            print(f"  early stop at step {step} (proxy plateau, overlap=0)")
+                        break
+
+        # Restore best checkpointed state if we found a valid one
+        if _best_proxy < float("inf"):
+            free_pos  = _best_free_pos
+            free_soft = _best_free_soft
+            if self.verbose:
+                print(f"  restoring best checkpoint  proxy={_best_proxy:.6f}")
 
         # Write back
         with torch.no_grad():
