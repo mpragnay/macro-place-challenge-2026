@@ -65,13 +65,42 @@ class MyPlacer:
 | Method | Avg Proxy Cost |
 |--------|---------------|
 | DreamPlace++ (target to beat) | 1.3998 |
+| **SweepingBellPlacement (current)** | **1.4427** |
 | RePlAce baseline | 1.4578 |
 | Initial positions (invalid — 1939 overlaps) | 1.4551 |
 | Greedy row placer (valid) | ~2.21 |
+| SA baseline | ~2.1251 |
 
 **Key insight**: Initial positions are connectivity-aware and near-RePlAce quality (1.455) but have 1939 overlaps. The challenge is resolving overlaps with minimal cost increase. Naive legalization costs ~2.21.
 
-## Current Approach: Gradient Placer
+## Submission Results (SweepingBellPlacement)
+
+| BM | Proxy | vs SA | vs RePlAce | Overlaps |
+|----|-------|-------|-----------|---------|
+| ibm01 | 1.0190 | +22.6% | −2.1% | 0 |
+| ibm02 | 1.5600 | +18.2% | +15.1% | 0 |
+| ibm03 | 1.3047 | +25.0% | +1.3% | 0 |
+| ibm04 | 1.3101 | +12.9% | −0.6% | 0 |
+| ibm06 | 1.6310 | +34.9% | −0.8% | 0 |
+| ibm07 | 1.4534 | +28.2% | +0.7% | 0 |
+| ibm08 | 1.4461 | +24.8% | −1.2% | 0 |
+| ibm09 | 1.1044 | +20.4% | +1.3% | 0 |
+| ibm10 | 1.3221 | +37.4% | +11.9% | 0 |
+| ibm11 | 1.1950 | +30.2% | −1.5% | 0 |
+| ibm12 | 1.6243 | +42.5% | +5.9% | 0 |
+| ibm13 | 1.3671 | +28.6% | −2.4% | 0 |
+| ibm14 | 1.5899 | +30.1% | −3.0% | 0 |
+| ibm15 | 1.5836 | +31.1% | −4.5% | 0 |
+| ibm16 | 1.4857 | +33.5% | −0.5% | 0 |
+| ibm17 | 1.7391 | +52.6% | −5.7% | 0 |
+| ibm18 | 1.7899 | +35.5% | −1.0% | 0 |
+| **AVG** | **1.4427** | **+32.1%** | **+1.0%** | **0** |
+
+Avg runtime: 632.56s/benchmark. Beats RePlAce by 1.0%, beats SA by 32.1%. Still 0.43% above DreamPlace++ target (1.3998).
+
+**Benchmarks still above RePlAce**: ibm02 (+15.1%), ibm10 (+11.9%), ibm12 (+5.9%), ibm03 (+1.3%), ibm09 (+1.3%), ibm07 (+0.7%). These are the priority targets.
+
+## Current Approach: SweepingBellPlacement
 
 File: `submissions/gradient_placer.py`
 
@@ -446,16 +475,18 @@ ibm02 sweep (16 configs): **best=1.5903 at w_den=0.01, w_reg=2.0** — cannot be
 
 ibm04 sweep (16 configs): **best=1.3113 at w_den=0.1, w_reg=1.0** — beats overlap-only baseline (1.3133).
 
-### Next Steps (Compute Cluster Priority)
+### Next Steps
 
-**Immediate**: Extend pilot sweep to also select `(w_density, w_reg)` per benchmark using the plc evaluator. For benchmarks where w_density=0 gives best score → disable bell loss. For others → find optimal weight pair. This should fix regressions while keeping improvements.
+**Current score**: 1.4427 avg — beats RePlAce (1.4578) by 1.0%, gap to DreamPlace++ (1.3998) is 0.0429.
 
-**Algorithm**:
-1. Pilot phase A (500 steps, overlap only): select lr
-2. Pilot phase B (500 steps each, joint loss): sweep `w_density ∈ {0, 0.01, 0.05, 0.1}`, `w_reg ∈ {0.2, 0.5, 1.0, 2.0}` — evaluate proxy → select best `(w_density, w_reg)` 
-3. Full run (10k steps) with selected params
+**Priority targets** (above RePlAce baseline):
+- ibm02 (+15.1%), ibm10 (+11.9%), ibm12 (+5.9%) — largest gaps, most room for improvement
+- ibm03 (+1.3%), ibm09 (+1.3%), ibm07 (+0.7%) — marginal, may need different approach
 
-**Expected outcome**: ibm01/03/07/08/10/11/17 keep improvements, ibm02/06/12/14/15/16 fall back to overlap-only (w_density=0).
+**Ideas to close the gap**:
+1. Wirelength loss — ibm02/10/12 have high congestion; adding HPWL gradient could help
+2. Wider pilot sweep on problem benchmarks — more lr/wd/wr candidates
+3. Longer runs for benchmarks that plateaued early (ibm17 at 2656s still far above RePlAce)
 
 ## Known Issues / Pending Work
 
